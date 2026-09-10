@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -379,7 +380,14 @@ Project: $projectName"""
                 if (sessionActive) {
                     LlamaBridge.generateContinueStream(prompt, callback)
                 } else {
-                    LlamaBridge.generateWithContextStream(system, context + "\n\n" + history, user, callback)
+                    LlamaBridge.generateWithContextStream(
+                        system,
+                        context + "\n\n" + history,
+                        user,
+                        onDelta = { text -> appendStream(text) },
+                        onDone = { completeStream() },
+                        onError = { message -> failTask(message) }
+                    )
                 }
             } catch (e: Throwable) {
                 failTask(e.message ?: "Native generation failed")
@@ -882,7 +890,7 @@ private fun Composer(
 }
 
 @Composable
-private fun ComposerAction(title: String, icon: androidx.compose.ui.graphics.vector.ImageVector, action: () -> Unit) {
+private fun RowScope.ComposerAction(title: String, icon: androidx.compose.ui.graphics.vector.ImageVector, action: () -> Unit) {
     TextButton(onClick = action, modifier = Modifier.weight(1f)) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Icon(icon, null, tint = CYAN, modifier = Modifier.size(18.dp))
@@ -1137,18 +1145,18 @@ private fun NotesApp() {
     }
 }
 """),
-    ProjectFile("app/src/main/java/com/sa/notes/Note.kt", "package com.sa.notes
+    ProjectFile("app/src/main/java/com/sa/notes/Note.kt", """package com.sa.notes
 
 data class Note(val id: Long, val text: String)
-"),
-    ProjectFile("app/src/main/java/com/sa/notes/NoteRepository.kt", "package com.sa.notes
+"""),
+    ProjectFile("app/src/main/java/com/sa/notes/NoteRepository.kt", """package com.sa.notes
 
 class NoteRepository
-"),
-    ProjectFile("app/src/main/java/com/sa/notes/NoteViewModel.kt", "package com.sa.notes
+"""),
+    ProjectFile("app/src/main/java/com/sa/notes/NoteViewModel.kt", """package com.sa.notes
 
 class NoteViewModel
-"),
+"""),
     ProjectFile("app/src/main/AndroidManifest.xml", """<manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application android:theme="@style/Theme.NotesApp" android:label="$name" android:allowBackup="false" android:supportsRtl="true">
         <activity android:name=".MainActivity" android:exported="true" android:windowSoftInputMode="adjustResize">
