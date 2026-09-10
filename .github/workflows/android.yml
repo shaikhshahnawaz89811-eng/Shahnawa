@@ -35,9 +35,15 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
-          accept-android-sdk-licenses: 'true'
-          log-accepted-android-sdk-licenses: 'false'
-          packages: 'platform-tools platforms;android-37 build-tools;36.0.0'
+          accept-android-sdk-licenses: true
+          packages: 'platform-tools'
+      - name: Install Android build SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" 
       - name: Verify dependency graph resolves
         run: gradle dependencies --configuration debugRuntimeClasspath --stacktrace
       - name: Unit tests
