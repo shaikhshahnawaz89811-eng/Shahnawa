@@ -1162,7 +1162,6 @@ class NoteViewModel
 """),
     ProjectFile("app/build.gradle.kts", """plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
@@ -1180,7 +1179,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
 }
 
@@ -1203,9 +1201,12 @@ dependencies {
 """),
     ProjectFile("build.gradle.kts", """plugins {
     id("com.android.application") version "9.4.0" apply false
-    id("org.jetbrains.kotlin.android") version "2.3.21" apply false
     id("org.jetbrains.kotlin.plugin.compose") version "2.3.21" apply false
 }
+"""),
+    ProjectFile("gradle.properties", """org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+android.useAndroidX=true
+kotlin.code.style=official
 """),
     ProjectFile("settings.gradle.kts", """pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
 dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }

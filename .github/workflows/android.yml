@@ -42,8 +42,8 @@ jobs:
         run: |
           set -euo pipefail
           sdkmanager --install \
-            "platforms;android-36" \
-            "build-tools;36.0.0" 
+            "platforms;android-37" \
+            "build-tools;37.0.0" 
       - name: Verify dependency graph resolves
         run: gradle dependencies --configuration debugRuntimeClasspath --stacktrace
       - name: Unit tests
