@@ -45,7 +45,7 @@ jobs:
             "platforms;android-37.0" \
             "build-tools;37.0.0" 
       - name: Verify dependency graph resolves
-        run: gradle dependencies --configuration debugRuntimeClasspath --stacktrace
+        run: gradle :app:dependencies --configuration debugRuntimeClasspath --stacktrace
       - name: Unit tests
         run: gradle :app:testDebugUnitTest --stacktrace
       - name: Android lint
