@@ -93,7 +93,7 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
 
     var screen by mutableStateOf(Screen.CHAT)
     var input by mutableStateOf("")
-    var projectName by mutableStateOf(prefs.getString("project", "NotesApp") ?: "NotesApp")
+    var projectName by mutableStateOf(prefs.getString("project", "MyApp") ?: "MyApp")
     var selectedFile by mutableStateOf("")
     var code by mutableStateOf("")
     var modelPath by mutableStateOf(prefs.getString("modelPath", "") ?: "")
@@ -360,6 +360,9 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
 Never claim a file was changed, a build passed, or an app was installed unless SA actually performed that operation.
 Inspect first. Explain root cause before proposing a fix. Prefer minimal, connected changes. Keep answers concise but useful.
 When you actually need to change workspace files, emit one or more exact blocks using <sa_action type="create|update|delete" path="relative/path">content</sa_action>. Do not claim an action succeeded unless the block is valid.
+Example: <sa_action type="create" path="app/src/main/java/com/sa/app/Student.kt">package com.sa.app
+data class Student(val id: Long, val name: String)</sa_action>
+Always use this exact tag syntax to create or edit files. A plain ``` code fence is only for showing a snippet in the chat reply — it never updates the workspace, so any file the user asked for must also appear as an <sa_action> block.
 Project: $projectName"""
         val history = recentHistory()
         val prompt = "Conversation:\n$history\n\nCurrent project context:\n$context\n\nAttachment context:\n$attachmentContext\n\nUser request:\n$user"
@@ -1106,8 +1109,15 @@ private fun Action(title: String, icon: androidx.compose.ui.graphics.vector.Imag
     TextButton(onClick = action, contentPadding = PaddingValues(horizontal = 9.dp, vertical = 3.dp)) { Icon(icon, null, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)); Text(title, fontSize = 10.sp) }
 }
 
+// Deliberately domain-neutral: this used to hard-code a Notes app (Note.kt, NoteRepository.kt,
+// NoteViewModel.kt under com.sa.notes) no matter what `name` was passed in, so every new
+// project's "current project context" sent to the model was Notes-shaped even when the user
+// asked for something else (e.g. a school management app). The model then anchored on that
+// misleading context instead of the actual request. This starter now only contains a blank
+// activity so buildContext() has nothing domain-specific to leak, and real feature files are
+// expected to arrive via <sa_action> once the user describes what they want.
 fun starterFiles(name: String): List<ProjectFile> = listOf(
-    ProjectFile("app/src/main/java/com/sa/notes/MainActivity.kt", """package com.sa.notes
+    ProjectFile("app/src/main/java/com/sa/app/MainActivity.kt", """package com.sa.app
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -1126,39 +1136,27 @@ import androidx.compose.ui.unit.dp
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { NotesApp() }
+        setContent { StarterApp() }
     }
 }
 
 @Composable
-private fun NotesApp() {
+private fun StarterApp() {
     MaterialTheme {
         Surface(Modifier.fillMaxSize()) {
             Column(
                 modifier = Modifier.fillMaxSize().padding(24.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Text("NotesApp", style = MaterialTheme.typography.headlineMedium)
-                Text("Starter project created by SA.")
+                Text("$name", style = MaterialTheme.typography.headlineMedium)
+                Text("Blank starter created by SA. Describe the app in chat to generate real files.")
             }
         }
     }
 }
 """),
-    ProjectFile("app/src/main/java/com/sa/notes/Note.kt", """package com.sa.notes
-
-data class Note(val id: Long, val text: String)
-"""),
-    ProjectFile("app/src/main/java/com/sa/notes/NoteRepository.kt", """package com.sa.notes
-
-class NoteRepository
-"""),
-    ProjectFile("app/src/main/java/com/sa/notes/NoteViewModel.kt", """package com.sa.notes
-
-class NoteViewModel
-"""),
     ProjectFile("app/src/main/AndroidManifest.xml", """<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application android:theme="@style/Theme.NotesApp" android:label="$name" android:allowBackup="false" android:supportsRtl="true">
+    <application android:theme="@style/Theme.SA" android:label="$name" android:allowBackup="false" android:supportsRtl="true">
         <activity android:name=".MainActivity" android:exported="true" android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -1174,10 +1172,10 @@ class NoteViewModel
 }
 
 android {
-    namespace = "com.sa.notes"
+    namespace = "com.sa.app"
     compileSdk = 37
     defaultConfig {
-        applicationId = "com.sa.notes"
+        applicationId = "com.sa.app"
         minSdk = 29
         targetSdk = 37
         versionCode = 1
@@ -1199,7 +1197,7 @@ dependencies {
 }
 """),
     ProjectFile("app/src/main/res/values/styles.xml", """<resources>
-    <style name="Theme.NotesApp" parent="android:style/Theme.Material.NoActionBar">
+    <style name="Theme.SA" parent="android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:statusBarColor">#050914</item>
