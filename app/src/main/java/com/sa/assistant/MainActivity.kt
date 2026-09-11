@@ -128,6 +128,9 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
     private var generationFinished = false
     private var generationCancelled = false
     private val processedActionKeys = mutableSetOf<String>()
+    // Set true only when a create/update/delete action actually mutates `files` this turn.
+    // completeStream() checks this to decide whether an auto-zip snapshot is worth writing.
+    private var workspaceChangedThisTurn = false
 
     init {
         restoreState()
@@ -334,6 +337,7 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
         generationFinished = false
         generationCancelled = false
         processedActionKeys.clear()
+        workspaceChangedThisTurn = false
         generationJob = viewModelScope.launch { runAgent(text) }
     }
 
@@ -356,12 +360,13 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun streamAgent(user: String, context: String) {
-        val system = """You are SA, an offline Android coding assistant.
+        val system = """You are SA, an offline coding assistant. This project happens to be Android/Kotlin, but you are not limited to Kotlin — if the user asks for code in Python, Java, JavaScript, C++, or any other language, write it in that language and give the file the matching extension.
 Never claim a file was changed, a build passed, or an app was installed unless SA actually performed that operation.
 Inspect first. Explain root cause before proposing a fix. Prefer minimal, connected changes. Keep answers concise but useful.
 When you actually need to change workspace files, emit one or more exact blocks using <sa_action type="create|update|delete" path="relative/path">content</sa_action>. Do not claim an action succeeded unless the block is valid.
 Example: <sa_action type="create" path="app/src/main/java/com/sa/app/Student.kt">package com.sa.app
 data class Student(val id: Long, val name: String)</sa_action>
+This example only demonstrates the tag syntax. It is Kotlin because the surrounding project is Kotlin — always use whatever language and file extension the user's actual request calls for (.py, .js, .java, .cpp, etc.), not just .kt.
 Always use this exact tag syntax to create or edit files. A plain ``` code fence is only for showing a snippet in the chat reply — it never updates the workspace, so any file the user asked for must also appear as an <sa_action> block.
 Project: $projectName"""
         val history = recentHistory()
@@ -420,13 +425,21 @@ Project: $projectName"""
         if (chunk.isEmpty() && !force) return
         val id = streamMessageId ?: return
         val index = messages.indexOfFirst { it.id == id }
+        // Recompute the visible text from the FULL raw buffer every tick, not from
+        // (previously shown text + this delta). old.text is already-stripped output;
+        // feeding it back into visibleResponse() together with only the newest raw
+        // delta silently drops whatever was cut out earlier (e.g. an in-progress
+        // <sa_action> block) and glues unrelated fragments together with no space —
+        // that's what produced merged words, missing line breaks, and a stray
+        // "</sa_action>" leaking into the bubble. The raw buffer already holds the
+        // complete text since this message started, so always derive from it.
+        val raw = synchronized(rawStreamBuffer) { rawStreamBuffer.toString() }
         if (index >= 0 && chunk.isNotEmpty()) {
             val old = messages[index]
-            messages[index] = old.copy(text = visibleResponse(old.text + chunk))
+            messages[index] = old.copy(text = visibleResponse(raw))
         }
         // Parse completed SA file-action blocks only on the coalesced UI tick. This avoids
         // launching a main-thread coroutine for every native token.
-        val raw = synchronized(rawStreamBuffer) { rawStreamBuffer.toString() }
         applyModelActions(raw)
     }
 
@@ -442,6 +455,7 @@ Project: $projectName"""
                 if (i >= 0) workLines[i] = workLines[i].copy(state = StepState.SUCCESS, detail = "Generation completed and the response was finalized.")
             }
             addWorkLine("Verify", "Response state, generated actions, and workspace persistence were finalized.", StepState.SUCCESS)
+            if (workspaceChangedThisTurn) autoExportZip()
             messages.indexOfFirst { it.id == streamMessageId }.takeIf { it >= 0 }?.let { i -> messages[i] = messages[i].copy(streaming = false) }
             isWorking = false
             sessionActive = true
@@ -592,6 +606,38 @@ Project: $projectName"""
         }
     }
 
+    // Auto-zip runs with no user gesture, so it can't use the CreateDocument picker
+    // exportZip() uses (Android requires a tap for that). It writes into this app's
+    // own external-files directory instead — no runtime permission needed, and it's
+    // a separate, additional snapshot; the manual Export ZIP screen is unchanged.
+    private fun autoExportZip() {
+        val exportFiles = files.toList()
+        if (exportFiles.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val dir = File(getApplication<Application>().getExternalFilesDir(null), "auto_zips")
+                dir.mkdirs()
+                val target = File(dir, "${projectName}_${System.currentTimeMillis()}.zip")
+                FileOutputStream(target).use { output ->
+                    ZipOutputStream(output).use { zip ->
+                        exportFiles.forEach { f ->
+                            zip.putNextEntry(ZipEntry(f.path))
+                            zip.write(f.content.toByteArray())
+                            zip.closeEntry()
+                        }
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    addWorkLine("Auto-saved ZIP", "Saved ${exportFiles.size} files to ${target.absolutePath}", StepState.SUCCESS)
+                }
+            } catch (e: Throwable) {
+                withContext(Dispatchers.Main) {
+                    addWorkLine("Auto ZIP failed", e.message ?: "unknown error", StepState.FAILED)
+                }
+            }
+        }
+    }
+
     fun resumeLater() {
         lastTaskSaved = true
         persistState()
@@ -641,6 +687,7 @@ Project: $projectName"""
                         addWorkLine("Create failed", "$path already exists", StepState.FAILED)
                     } else {
                         files += ProjectFile(path, content)
+                        workspaceChangedThisTurn = true
                         addWorkLine("Created $path", "Created ${content.lines().size} lines.", StepState.SUCCESS)
                     }
                 }
@@ -651,6 +698,7 @@ Project: $projectName"""
                     } else {
                         files[i] = files[i].copy(content = content)
                         if (selectedFile == path) code = content
+                        workspaceChangedThisTurn = true
                         addWorkLine("Updated $path", "Replaced the saved file content and refreshed the selected editor when applicable.", StepState.SUCCESS)
                     }
                 }
@@ -661,6 +709,7 @@ Project: $projectName"""
                             selectedFile = files.firstOrNull()?.path.orEmpty()
                             code = files.firstOrNull()?.content.orEmpty()
                         }
+                        workspaceChangedThisTurn = true
                         addWorkLine("Deleted $path", "The workspace entry was removed.", StepState.SUCCESS)
                     } else addWorkLine("Delete failed", "$path does not exist", StepState.FAILED)
                 }
@@ -879,9 +928,16 @@ private fun Composer(
             BasicTextField(
                 value = vm.input,
                 onValueChange = { vm.input = it.take(12000) },
-                modifier = Modifier.weight(1f).heightIn(min = 36.dp, max = 120.dp).padding(horizontal = 8.dp, vertical = 9.dp),
+                // No fixed max height here on purpose: mixing a hard heightIn(max=...) with
+                // maxLines made the field clip its 6th line instead of showing it, which is
+                // what read as "grows oddly". maxLines alone grows the field to fit exactly
+                // that many real lines (correct for any font size), then BasicTextField's
+                // built-in cursor-follow scrolling takes over automatically — no separate
+                // .verticalScroll() needed, and combining one here would just fight it.
+                modifier = Modifier.weight(1f).heightIn(min = 36.dp).padding(horizontal = 8.dp, vertical = 9.dp),
                 textStyle = TextStyle(color = TXT, fontSize = 13.sp, lineHeight = 18.sp),
-                maxLines = 6,
+                minLines = 1,
+                maxLines = 5,
                 cursorBrush = androidx.compose.ui.graphics.SolidColor(CYAN),
                 decorationBox = { inner -> if (vm.input.isEmpty()) Text("Message SA...", color = MUTED, fontSize = 13.sp); inner() }
             )
