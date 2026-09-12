@@ -39,6 +39,13 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
     var modelName by mutableStateOf(prefs.getString("modelName", "No GGUF model loaded") ?: "No GGUF model loaded")
     var modelLoaded by mutableStateOf(false)
     var modelMeta by mutableStateOf("Import an instruction-tuned GGUF model")
+    var modelOp by mutableStateOf(ModelOp.IDLE)
+    // Rough estimate only — GenStream hands back text deltas, not a token count, so
+    // these are chars/4 (a standard rough approximation), not an exact tokenizer count.
+    var lastPromptTokens by mutableStateOf(0)
+    var lastOutputTokens by mutableStateOf(0)
+    var lastGenSeconds by mutableStateOf(0.0)
+    private var generationStartMs = 0L
     var taskTitle by mutableStateOf("")
     var errorText by mutableStateOf("")
     var isWorking by mutableStateOf(false)
@@ -75,7 +82,18 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
     val statusLabel: String
         get() {
             fileCards.firstOrNull { it.state == CardState.STREAMING }?.let {
-                return "Writing ${it.path.substringAfterLast('/')}"
+                // Match the exact verb the card itself shows ("Creating…" / "Updating…" /
+                // "Deleting…") so the header never describes the same action with a
+                // different word — that mismatch is what made this read like two
+                // different things were happening (and confused with the unrelated
+                // "Wiring" step name) instead of one.
+                val verb = when (it.kind) {
+                    "create" -> "Creating"
+                    "update" -> "Updating"
+                    "delete" -> "Deleting"
+                    else -> "Writing"
+                }
+                return "$verb ${it.path.substringAfterLast('/')}"
             }
             workLines.lastOrNull { it.state == StepState.RUNNING }?.let { return it.title }
             return if (isWorking) "Working" else if (modelLoaded) modelName else "Offline AI Coding Assistant"
@@ -269,31 +287,52 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
         screen = Screen.CHAT
     }
 
+    // Every one of these four (Import/Load/Unload/Delete) checks modelOp == IDLE
+    // before doing anything and holds a non-IDLE value for its entire duration —
+    // that's the whole fix for double-tap races: a second tap on anything while
+    // one of them is running is simply a no-op, not a second overlapping action.
     fun importModel(context: Context, uri: Uri) {
-        viewModelScope.launch(Dispatchers.IO) {
+        if (modelOp != ModelOp.IDLE) return
+        modelOp = ModelOp.IMPORTING
+        viewModelScope.launch {
             try {
-                val dir = File(context.filesDir, "models").apply { mkdirs() }
-                val name = (uri.lastPathSegment?.substringAfterLast('/') ?: "model.gguf")
-                    .replace(Regex("[^A-Za-z0-9._-]"), "_")
-                val target = File(dir, name)
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(target).use { output -> input.copyTo(output, 1024 * 1024) }
-                } ?: error("Unable to open selected model")
-                withContext(Dispatchers.Main) {
-                    modelPath = target.absolutePath
-                    modelName = name
-                    modelMeta = "Imported locally • ${target.length() / (1024 * 1024)} MB • loading…"
-                    prefs.edit().putString("modelPath", modelPath).putString("modelName", modelName).apply()
+                val target = withContext(Dispatchers.IO) {
+                    val dir = File(context.filesDir, "models").apply { mkdirs() }
+                    val name = (uri.lastPathSegment?.substringAfterLast('/') ?: "model.gguf")
+                        .replace(Regex("[^A-Za-z0-9._-]"), "_")
+                    val t = File(dir, name)
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        FileOutputStream(t).use { output -> input.copyTo(output, 1024 * 1024) }
+                    } ?: error("Unable to open selected model")
+                    t
                 }
-                loadModel(target.absolutePath)
+                modelPath = target.absolutePath
+                modelName = target.name
+                modelMeta = "Imported locally • ${target.length() / (1024 * 1024)} MB • loading…"
+                prefs.edit().putString("modelPath", modelPath).putString("modelName", modelName).apply()
+                performLoad(target.absolutePath)
             } catch (e: Throwable) {
-                withContext(Dispatchers.Main) { modelLoaded = false; modelMeta = "Model import failed: ${e.message ?: "unknown error"}" }
+                modelLoaded = false
+                modelMeta = "Model import failed: ${e.message ?: "unknown error"}"
             }
+            modelOp = ModelOp.IDLE
         }
     }
 
-    private fun loadModel(path: String) {
-        viewModelScope.launch(Dispatchers.IO) {
+    // Load button — only reachable from the UI when a model is imported and not
+    // already loaded (see SettingsScreen), but re-checked here too since state and
+    // UI can be one frame apart.
+    fun loadModel(path: String) {
+        if (modelOp != ModelOp.IDLE || path.isBlank() || modelLoaded) return
+        modelOp = ModelOp.LOADING
+        viewModelScope.launch {
+            performLoad(path)
+            modelOp = ModelOp.IDLE
+        }
+    }
+
+    private suspend fun performLoad(path: String) {
+        withContext(Dispatchers.IO) {
             try {
                 LlamaBridge.updateGenerateParams(
                     temperature = 0.35f,
@@ -326,6 +365,37 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: Throwable) {
                 withContext(Dispatchers.Main) { modelLoaded = false; modelMeta = "Load failed: ${e.message ?: "native error"}" }
             }
+        }
+    }
+
+    // Unload button — only reachable from the UI while modelLoaded is true. Frees the
+    // native model from memory but keeps the .gguf file on disk, so Load can bring the
+    // same model straight back without re-importing.
+    fun unloadModel() {
+        if (modelOp != ModelOp.IDLE || !modelLoaded) return
+        modelOp = ModelOp.UNLOADING
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { runCatching { LlamaBridge.shutdown() } }
+            modelLoaded = false
+            sessionActive = false
+            modelMeta = "Unloaded • tap Load to use this model again"
+            modelOp = ModelOp.IDLE
+        }
+    }
+
+    // Delete button — only reachable from the UI when a model is imported AND not
+    // loaded (Delete never runs against a model still in memory; Unload first).
+    fun deleteModel() {
+        if (modelOp != ModelOp.IDLE || modelLoaded || modelPath.isBlank()) return
+        modelOp = ModelOp.DELETING
+        val pathToDelete = modelPath
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { runCatching { File(pathToDelete).delete() } }
+            modelPath = ""
+            modelName = "No GGUF model loaded"
+            modelMeta = "Import an instruction-tuned GGUF model"
+            prefs.edit().remove("modelPath").remove("modelName").apply()
+            modelOp = ModelOp.IDLE
         }
     }
 
@@ -421,6 +491,15 @@ Project: $projectName"""
         synchronized(streamBuffer) { streamBuffer.setLength(0) }
         synchronized(rawStreamBuffer) { rawStreamBuffer.setLength(0) }
 
+        // chars/4 is a standard rough stand-in for a token count — GenStream only
+        // hands back text deltas, no real tokenizer count, so this is an estimate
+        // shown as "~" in the Model card, not an exact figure.
+        val promptCharsForEstimate = if (sessionActive) prompt.length else system.length + context.length + history.length + user.length
+        lastPromptTokens = (promptCharsForEstimate / 4).coerceAtLeast(0)
+        lastOutputTokens = 0
+        lastGenSeconds = 0.0
+        generationStartMs = System.currentTimeMillis()
+
         withContext(Dispatchers.IO) {
             try {
                 val callback = object : GenStream {
@@ -493,6 +572,9 @@ Project: $projectName"""
         }
         viewModelScope.launch(Dispatchers.Main) {
             flushStreamBuffer(true)
+            val outChars = synchronized(rawStreamBuffer) { rawStreamBuffer.length }
+            lastOutputTokens = (outChars / 4).coerceAtLeast(0)
+            lastGenSeconds = (System.currentTimeMillis() - generationStartMs) / 1000.0
             // A max-token cutoff can end generation mid-tag; a card left STREAMING forever
             // would silently lie about still being in progress, so close it out here too.
             markInterruptedCardsAsFailed()
@@ -520,6 +602,9 @@ Project: $projectName"""
         }
         viewModelScope.launch(Dispatchers.Main) {
             flushStreamBuffer(true)
+            val outChars = synchronized(rawStreamBuffer) { rawStreamBuffer.length }
+            lastOutputTokens = (outChars / 4).coerceAtLeast(0)
+            lastGenSeconds = (System.currentTimeMillis() - generationStartMs) / 1000.0
             markInterruptedCardsAsFailed()
             generationWorkLineId?.let { id ->
                 val i = workLines.indexOfFirst { it.id == id }
@@ -786,14 +871,22 @@ Project: $projectName"""
                     applyClosedAction(cardId, type, path, closeMatch.groupValues[3].trimStart('\n', '\r'))
                     appliedAny = true
                 }
+            } else if (index != opens.lastIndex) {
+                // A later <sa_action> already opened before this one's closing tag
+                // arrived, so this one will never receive another token — the model
+                // moved on without closing it. Previously this stayed marked
+                // STREAMING forever (open, spinner, cyan border) with frozen content,
+                // which is why several cards could sit open at once with nothing
+                // actually being written into any but the newest. Mark it failed
+                // immediately instead so only the one file truly being written now
+                // ever shows as open.
+                upsertFileCard(cardId, type, path, summary = "Skipped — next file started before this one finished", state = CardState.FAILED)
             } else {
-                // Still streaming: live content is whatever has arrived since the tag
-                // opened, capped at the next action's opening tag if one has already
-                // started (defensive only — the model is instructed to close each
-                // block before starting another).
+                // Still streaming: this is the one action with no close yet, and
+                // nothing has opened after it — live content is everything since its
+                // tag opened.
                 val contentStart = openMatch.range.last + 1
-                val nextOpenStart = opens.getOrNull(index + 1)?.range?.first ?: raw.length
-                val live = raw.substring(contentStart, nextOpenStart.coerceAtLeast(contentStart)).trimStart('\n', '\r')
+                val live = raw.substring(contentStart).trimStart('\n', '\r')
                 upsertFileCard(cardId, type, path, liveContent = live, state = CardState.STREAMING)
             }
         }

@@ -35,6 +35,14 @@ internal enum class StepState { WAITING, RUNNING, SUCCESS, FAILED, PAUSED }
 // model output behind it.
 internal enum class CardState { STREAMING, DONE, FAILED }
 
+// Single busy-flag for the four model-management actions (Import/Load/Unload/
+// Delete). Every button in the Model settings card checks this before it will
+// do anything, and every action sets it back to IDLE only once fully done —
+// that's what stops a fast double-tap from firing two overlapping actions
+// (e.g. Delete while a Load is still in flight) and leaving modelLoaded/
+// modelPath in a state neither action alone would have produced.
+internal enum class ModelOp { IDLE, IMPORTING, LOADING, UNLOADING, DELETING }
+
 data class ProjectFile(val path: String, val content: String)
 data class ChatMessage(val id: Long, val user: Boolean, val text: String, val streaming: Boolean = false, val zipUri: String? = null, val zipName: String? = null)
 data class Attachment(val uri: String, val name: String, val kind: String = "file")

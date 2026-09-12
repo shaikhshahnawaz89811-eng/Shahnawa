@@ -37,19 +37,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 @Composable
-internal fun Timeline(vm: SAViewModel) {
-    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-        vm.timeline.forEach { item ->
-            when (item) {
-                is TimelineItem.Line -> WorkLineRow(vm, item.line)
-                is TimelineItem.Card -> FileCardRow(vm, item.card)
-            }
-        }
-    }
-}
-
-@Composable
-private fun WorkLineRow(vm: SAViewModel, line: WorkLine) {
+internal fun WorkLineRow(vm: SAViewModel, line: WorkLine) {
     val expanded = vm.expandedWorkLineId == line.id
     Column(
         Modifier
@@ -85,7 +73,7 @@ private fun WorkLineRow(vm: SAViewModel, line: WorkLine) {
 // visible; once it finishes it collapses to one line automatically. Tapping a finished
 // card re-expands it or opens the full file, exactly the same gesture either way.
 @Composable
-private fun FileCardRow(vm: SAViewModel, card: FileCard) {
+internal fun FileCardRow(vm: SAViewModel, card: FileCard) {
     val expanded = card.state == CardState.STREAMING || vm.expandedFileCardId == card.id
     val borderColor = if (card.state == CardState.STREAMING) CYAN else BORDER
     val verb = when (card.kind) {

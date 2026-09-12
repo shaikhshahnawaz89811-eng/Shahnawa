@@ -67,7 +67,7 @@ internal fun Chat(vm: SAViewModel) {
             Box(Modifier.weight(1f)) { Welcome() }
         } else {
             val listState = rememberLazyListState()
-            val itemCount = vm.messages.size + (if (vm.timeline.isNotEmpty()) 1 else 0) + (if (vm.attachments.isNotEmpty()) 1 else 0)
+            val itemCount = vm.messages.size + vm.timeline.size + (if (vm.attachments.isNotEmpty()) 1 else 0)
             val atBottom by remember {
                 derivedStateOf {
                     val info = listState.layoutInfo
@@ -83,7 +83,12 @@ internal fun Chat(vm: SAViewModel) {
             }
             LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(12.dp)) {
                 items(vm.messages, key = { it.id }) { message -> MessageBubble(vm, message) }
-                if (vm.timeline.isNotEmpty()) item(key = "timeline") { Timeline(vm) }
+                items(vm.timeline, key = { "tl_${it.seq}" }) { entry ->
+                    when (entry) {
+                        is TimelineItem.Line -> WorkLineRow(vm, entry.line)
+                        is TimelineItem.Card -> FileCardRow(vm, entry.card)
+                    }
+                }
                 if (vm.attachments.isNotEmpty()) item(key = "attachments") { AttachmentStrip(vm) }
             }
         }

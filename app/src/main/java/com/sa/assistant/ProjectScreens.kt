@@ -242,9 +242,47 @@ internal fun SettingsScreen(vm: SAViewModel) {
             SettingsCard("Model") {
                 Text(vm.modelName, color = TXT, fontSize = 13.sp)
                 Text(vm.modelMeta, color = MUTED, fontSize = 11.sp)
+                if (vm.lastGenSeconds > 0.0) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Last run: ~${vm.lastPromptTokens} in \u00b7 ~${vm.lastOutputTokens} out \u00b7 ${"%.1f".format(vm.lastGenSeconds)}s",
+                        color = MUTED, fontSize = 11.sp
+                    )
+                }
                 Spacer(Modifier.height(8.dp))
-                Button(onClick = { pickModel.launch("*/*") }, colors = ButtonDefaults.buttonColors(containerColor = BLUE)) {
-                    Text("Import GGUF model")
+                val busy = vm.modelOp != ModelOp.IDLE
+                if (vm.modelPath.isBlank()) {
+                    Button(
+                        onClick = { pickModel.launch("*/*") },
+                        enabled = !busy,
+                        colors = ButtonDefaults.buttonColors(containerColor = BLUE)
+                    ) {
+                        Text(if (vm.modelOp == ModelOp.IMPORTING) "Importing…" else "Import GGUF model")
+                    }
+                } else {
+                    Row {
+                        if (vm.modelLoaded) {
+                            Button(
+                                onClick = { vm.unloadModel() },
+                                enabled = !busy,
+                                colors = ButtonDefaults.buttonColors(containerColor = BLUE)
+                            ) { Text(if (vm.modelOp == ModelOp.UNLOADING) "Unloading…" else "Unload") }
+                        } else {
+                            Button(
+                                onClick = { vm.loadModel(vm.modelPath) },
+                                enabled = !busy,
+                                colors = ButtonDefaults.buttonColors(containerColor = BLUE)
+                            ) { Text(if (vm.modelOp == ModelOp.LOADING) "Loading…" else "Load") }
+                            Spacer(Modifier.width(10.dp))
+                            OutlinedButton(onClick = { vm.deleteModel() }, enabled = !busy) {
+                                Text(if (vm.modelOp == ModelOp.DELETING) "Deleting…" else "Delete", color = RED)
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(onClick = { pickModel.launch("*/*") }, enabled = !busy) {
+                        Text("Import a different model", color = CYAN, fontSize = 12.sp)
+                    }
                 }
             }
             Spacer(Modifier.height(12.dp))

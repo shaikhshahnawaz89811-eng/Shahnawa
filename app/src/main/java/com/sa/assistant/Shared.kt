@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
@@ -55,7 +56,7 @@ internal fun SAApp() {
     val vm: SAViewModel = viewModel()
     MaterialTheme(colorScheme = darkColorScheme(background = BG, surface = SURFACE, primary = BLUE)) {
         Surface(Modifier.fillMaxSize(), color = BG) {
-            Column(Modifier.fillMaxSize().imePadding().navigationBarsPadding()) {
+            Column(Modifier.fillMaxSize().statusBarsPadding().imePadding().navigationBarsPadding()) {
                 Header(vm)
                 Box(Modifier.weight(1f)) {
                     when (vm.screen) {
