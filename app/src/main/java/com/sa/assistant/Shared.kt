@@ -56,9 +56,20 @@ internal fun SAApp() {
     val vm: SAViewModel = viewModel()
     MaterialTheme(colorScheme = darkColorScheme(background = BG, surface = SURFACE, primary = BLUE)) {
         Surface(Modifier.fillMaxSize(), color = BG) {
-            Column(Modifier.fillMaxSize().statusBarsPadding().imePadding().navigationBarsPadding()) {
+            // imePadding() used to live on this outer Column, which wraps Header AND the
+            // bottom tab bar together with the screen content. That made the keyboard
+            // shrink the WHOLE app: the fixed-size Bottom tab bar got squeezed up to sit
+            // right above the keyboard (since it's a sibling after the weighted content
+            // Box in the same Column), instead of staying put while only the active
+            // screen's own content/composer adjusted. It also meant that space stayed
+            // reserved at this top level for as long as the keyboard was up, so things
+            // stayed cramped until the keyboard was closed. Moving imePadding() onto just
+            // the content Box below keeps Header and Bottom fixed and lets the keyboard
+            // simply cover Bottom when it's open — only the visible screen (Chat's list +
+            // composer, Editor, etc.) resizes for it.
+            Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
                 Header(vm)
-                Box(Modifier.weight(1f)) {
+                Box(Modifier.weight(1f).imePadding()) {
                     when (vm.screen) {
                         Screen.CHAT -> Chat(vm)
                         Screen.CODE -> Editor(vm)

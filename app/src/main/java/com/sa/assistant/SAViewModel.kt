@@ -109,6 +109,23 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
     private var generationFinished = false
     private var generationCancelled = false
     private val processedActionKeys = mutableSetOf<String>()
+    // Small local GGUF models can lose the thread on a big multi-file ask (e.g. "build
+    // a whole shopping app") and start streaming out the same boilerplate body for every
+    // file it opens — same imports, same placeholder Text(...), regardless of the file's
+    // name or purpose. That is a model-quality failure, not a parse bug (each file really
+    // is being fed that exact text), but nothing was stopping the app from happily writing
+    // that duplicate content into file after file. Tracks the trimmed content already
+    // written this turn so a later create/update that is byte-for-byte the same as an
+    // earlier one this turn gets skipped instead of silently accepted as a real file.
+    private val turnContentSignatures = mutableSetOf<String>()
+    // Set from completeStream() when generation stops with a card still STREAMING — i.e.
+    // the maxTokens cutoff hit mid-file, not a real finish. Holds (path, whatever content
+    // had streamed in so far) so the *next* turn's prompt can tell the model exactly what
+    // it left unfinished, instead of the model only seeing "continue"/the next message
+    // with zero memory of being cut off — which is what made it just restart the file
+    // (or something adjacent to it) from scratch. Consumed (read once, then cleared) the
+    // next time streamAgent() runs.
+    private var pendingResume: Pair<String, String>? = null
     // Set true only when a create/update/delete action actually mutates `files` this turn.
     // completeStream() checks this to decide whether an auto-zip snapshot and a wiring
     // check are worth running.
@@ -279,6 +296,9 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
         messages += ChatMessage(System.currentTimeMillis(), false, "Project $projectName created. The workspace contains real editable files.")
         workLines.clear()
         fileCards.clear()
+        expandedFileCardId = null
+        expandedWorkLineId = null
+        pendingResume = null
         taskTitle = ""
         lastTaskSaved = false
         sessionActive = false
@@ -423,6 +443,14 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
         errorText = ""
         workLines.clear()
         fileCards.clear()
+        // Card ids are just "t0", "t1"... positional within a turn (see applyModelActions),
+        // so they get reused every turn. Leaving a stale expandedFileCardId/expandedWorkLineId
+        // around from a card the user tapped open earlier meant a brand-new, unrelated card
+        // that happened to land on the same id this turn rendered already-expanded — that's
+        // the "card stays open even after it's done writing" symptom. Clear both so every
+        // new turn starts with everything collapsed until the user actually taps something.
+        expandedFileCardId = null
+        expandedWorkLineId = null
         persistState()
         if (!modelLoaded) {
             errorText = "No local GGUF model is loaded. Open Settings → Model and import an instruction-tuned GGUF file."
@@ -439,6 +467,7 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
         generationFinished = false
         generationCancelled = false
         processedActionKeys.clear()
+        turnContentSignatures.clear()
         workspaceChangedThisTurn = false
         generationJob = viewModelScope.launch { runAgent(text) }
     }
@@ -454,13 +483,29 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
         return t.split(Regex("\\s+")).size <= 5 && actionWord.containsMatchIn(t)
     }
 
+    // A small local model sitting inside an Android/Kotlin project scaffold will keep
+    // writing Kotlin even when asked for "a website" — the existing .kt files in its own
+    // context (see buildContext()) anchor it far more strongly than one line in the
+    // system prompt saying it isn't limited to Kotlin. Detected here so streamAgent() can
+    // give an explicit, request-specific override instead of relying on that one generic
+    // line. Matches common English and Hinglish phrasings ("website", "web app", "vebsite",
+    // "html/css site"), not just the bare words "html"/"css" alone, to keep false positives
+    // low on requests that only mention a language in passing.
+    private fun isWebRequest(text: String): Boolean {
+        val t = text.lowercase()
+        val webPhrase = Regex("\\b(website|web[\\s-]?app|web[\\s-]?page|webpage|vebsite|landing page|static site)\\b")
+        val webStack = Regex("\\bhtml\\b.*\\bcss\\b|\\bcss\\b.*\\bhtml\\b")
+        return webPhrase.containsMatchIn(t) || webStack.containsMatchIn(t)
+    }
+
     private suspend fun runAgent(user: String) {
         try {
-            val context = buildContext()
+            val webRequest = isWebRequest(user)
+            val context = buildContext(webRequest)
             addWorkLine("Read workspace", "Loaded ${files.size} project files and bounded each file to the phone-safe context budget.", StepState.SUCCESS)
             addWorkLine("Prepare task context", "Prepared conversation history, project files, and the current user request.", StepState.SUCCESS)
             generationWorkLineId = addWorkLine("Generate", "Local GGUF generation started. Tokens will appear directly in the assistant response.", StepState.RUNNING)
-            streamAgent(user, context)
+            streamAgent(user, context, webRequest)
         } catch (e: Throwable) {
             failTask(e.message ?: "Generation failed")
         }
@@ -472,7 +517,7 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
         return id
     }
 
-    private suspend fun streamAgent(user: String, context: String) {
+    private suspend fun streamAgent(user: String, context: String, webRequest: Boolean = false) {
         val system = """You are SA, an offline coding assistant. This project happens to be Android/Kotlin, but you are not limited to Kotlin — if the user asks for code in Python, Java, JavaScript, C++, or any other language, write it in that language and give the file the matching extension.
 Never claim a file was changed, a build passed, or an app was installed unless SA actually performed that operation.
 Inspect first. Explain root cause before proposing a fix. Prefer minimal, connected changes. Keep answers concise but useful.
@@ -481,9 +526,24 @@ Example: <sa_action type="create" path="app/src/main/java/com/sa/app/Student.kt"
 data class Student(val id: Long, val name: String)</sa_action>
 This example only demonstrates the tag syntax. It is Kotlin because the surrounding project is Kotlin — always use whatever language and file extension the user's actual request calls for (.py, .js, .java, .cpp, etc.), not just .kt.
 Always use this exact tag syntax to create or edit files. A plain ``` code fence is only for showing a snippet in the chat reply — it never updates the workspace, so any file the user asked for must also appear as an <sa_action> block.
-Project: $projectName"""
+Project: $projectName""" + if (webRequest) """
+
+The current user request below is asking for a WEBSITE / web app, not an Android app. Write plain HTML, CSS, and JavaScript files only, using extensions .html, .css, .js — for example <sa_action type="create" path="index.html">...</sa_action> and <sa_action type="create" path="style.css">...</sa_action>. Do NOT write Kotlin, do NOT use .kt paths, and do NOT reuse Compose/Activity/Fragment patterns for this request, even though the files listed in the project context are Kotlin — those belong to this app itself, not to the website being asked for.""" else ""
         val history = recentHistory()
-        val prompt = "Conversation:\n$history\n\nCurrent project context:\n$context\n\nAttachment context:\n$attachmentContext\n\nUser request:\n$user"
+        // Consume pendingResume exactly once, for this call only — see its declaration.
+        // Without this, the model has no idea the last turn was cut off mid-file, so a
+        // plain "continue" reads to it like a brand-new ask and it restarts that file (or
+        // something near it) from zero rather than picking up the actual unfinished work.
+        val resumeNote = pendingResume?.let { (path, partial) ->
+            pendingResume = null
+            "\n\nIMPORTANT: your previous response was cut off by the response length limit " +
+                "while writing $path, and that partial version was NOT saved to the project. " +
+                "Partial content streamed so far (incomplete, do not treat as usable):\n$partial\n" +
+                "Before anything else, send one fresh, COMPLETE <sa_action type=\"create\" path=\"$path\">...</sa_action> " +
+                "block that finishes this file properly from the start, then continue with the rest of the request below."
+        }.orEmpty()
+        val fullContext = context + resumeNote
+        val prompt = "Conversation:\n$history\n\nCurrent project context:\n$fullContext\n\nAttachment context:\n$attachmentContext\n\nUser request:\n$user"
 
         val assistantId = System.currentTimeMillis()
         messages += ChatMessage(assistantId, false, "", true)
@@ -494,7 +554,7 @@ Project: $projectName"""
         // chars/4 is a standard rough stand-in for a token count — GenStream only
         // hands back text deltas, no real tokenizer count, so this is an estimate
         // shown as "~" in the Model card, not an exact figure.
-        val promptCharsForEstimate = if (sessionActive) prompt.length else system.length + context.length + history.length + user.length
+        val promptCharsForEstimate = if (sessionActive) prompt.length else system.length + fullContext.length + history.length + user.length
         lastPromptTokens = (promptCharsForEstimate / 4).coerceAtLeast(0)
         lastOutputTokens = 0
         lastGenSeconds = 0.0
@@ -512,7 +572,7 @@ Project: $projectName"""
                 } else {
                     LlamaBridge.generateWithContextStream(
                         system,
-                        context + "\n\n" + history,
+                        fullContext + "\n\n" + history,
                         user,
                         onDelta = { text -> appendStream(text) },
                         onDone = { completeStream() },
@@ -577,10 +637,21 @@ Project: $projectName"""
             lastGenSeconds = (System.currentTimeMillis() - generationStartMs) / 1000.0
             // A max-token cutoff can end generation mid-tag; a card left STREAMING forever
             // would silently lie about still being in progress, so close it out here too.
+            // Before wiping it, remember what that one unfinished file had so far — see
+            // pendingResume's declaration above. Only ever at most one card is genuinely
+            // STREAMING when generation stops (every earlier one already closed or got
+            // marked "skipped" the moment a later tag opened), so this is unambiguous.
+            val cutOff = fileCards.firstOrNull { it.state == CardState.STREAMING }
+            pendingResume = cutOff?.let { it.path to it.liveContent }
             markInterruptedCardsAsFailed()
             generationWorkLineId?.let { id ->
                 val i = workLines.indexOfFirst { it.id == id }
-                if (i >= 0) workLines[i] = workLines[i].copy(state = StepState.SUCCESS, detail = "Generation completed and the response was finalized.")
+                if (i >= 0) workLines[i] = workLines[i].copy(
+                    state = StepState.SUCCESS,
+                    detail = if (cutOff != null)
+                        "Hit the response length limit while writing ${cutOff.path.substringAfterLast('/')} — it was not saved. Send another message (e.g. \"continue\") and SA will rewrite that file properly instead of leaving it half-done."
+                    else "Generation completed and the response was finalized."
+                )
             }
             if (workspaceChangedThisTurn) checkWiring()
             addWorkLine("Verify", "Response state, generated actions, and workspace persistence were finalized.", StepState.SUCCESS)
@@ -913,6 +984,20 @@ Project: $projectName"""
             upsertFileCard(cardId, type, path, summary = "Unsafe path or oversized content", state = CardState.FAILED)
             return
         }
+        // See turnContentSignatures' declaration above. Only guard create/update — a
+        // duplicate "delete" isn't a real problem (deleting the same path twice is a
+        // no-op the second time) and content doesn't apply to it anyway.
+        if (type != "delete") {
+            val signature = content.trim()
+            if (signature.isNotEmpty() && !turnContentSignatures.add(signature)) {
+                upsertFileCard(
+                    cardId, type, path,
+                    summary = "Skipped — identical to another file already written this turn (the model looks stuck repeating itself)",
+                    state = CardState.FAILED
+                )
+                return
+            }
+        }
         when (type) {
             "create" -> {
                 // A brand-new project is seeded with starter scaffold files (AndroidManifest.xml,
@@ -1034,8 +1119,13 @@ Project: $projectName"""
         if (it.user) "USER: ${it.text}" else "SA: ${it.text.take(3500)}"
     }
 
-    private fun buildContext(): String = files.take(12).joinToString("\n\n") {
-        "FILE: ${it.path}\n${it.content.take(6000)}"
+    private fun buildContext(webRequest: Boolean = false): String {
+        val label = if (webRequest)
+            "(This is this app's own Android/Kotlin scaffold — unrelated to the website being asked for below. Do not copy its language or structure.)\n\n"
+        else ""
+        return label + files.take(12).joinToString("\n\n") {
+            "FILE: ${it.path}\n${it.content.take(6000)}"
+        }
     }
 
     override fun onCleared() {
