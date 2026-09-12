@@ -91,6 +91,7 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
                     "create" -> "Creating"
                     "update" -> "Updating"
                     "delete" -> "Deleting"
+                    "patch" -> "Patching"
                     else -> "Writing"
                 }
                 return "$verb ${it.path.substringAfterLast('/')}"
@@ -135,12 +136,19 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
     // the moment the model starts a file, instead of only once it finishes. The full
     // block regex below is unchanged from before and is still what actually applies a
     // file mutation; nothing is written to `files` until a block fully closes.
+    // "patch" (added below, alongside create/update/delete) is a small-model-friendly
+    // way to edit an existing file without the model having to reproduce the entire file
+    // just to change a few lines. Reproducing whole files for every small edit is exactly
+    // what was burning through the token budget and inviting drift/duplication on bigger
+    // asks — real small-model coding agents (e.g. the open-source SmallCode project)
+    // lean on search-and-replace patches instead of full-file rewrites for the same
+    // reason. See applyClosedAction's "patch" branch for the format.
     private val openActionRegex = Regex(
-        """<sa_action\s+type="(create|update|delete)"\s+path="([^"]+)">""",
+        """<sa_action\s+type="(create|update|delete|patch)"\s+path="([^"]+)">""",
         RegexOption.IGNORE_CASE
     )
     private val closeActionRegex = Regex(
-        """<sa_action\s+type="(create|update|delete)"\s+path="([^"]+)">(.*?)</sa_action>""",
+        """<sa_action\s+type="(create|update|delete|patch)"\s+path="([^"]+)">(.*?)</sa_action>""",
         setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
     )
 
@@ -466,6 +474,7 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
         screen = Screen.CHAT
         generationFinished = false
         generationCancelled = false
+        crashRetryCount = 0
         processedActionKeys.clear()
         turnContentSignatures.clear()
         workspaceChangedThisTurn = false
@@ -521,11 +530,19 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
         val system = """You are SA, an offline coding assistant. This project happens to be Android/Kotlin, but you are not limited to Kotlin — if the user asks for code in Python, Java, JavaScript, C++, or any other language, write it in that language and give the file the matching extension.
 Never claim a file was changed, a build passed, or an app was installed unless SA actually performed that operation.
 Inspect first. Explain root cause before proposing a fix. Prefer minimal, connected changes. Keep answers concise but useful.
-When you actually need to change workspace files, emit one or more exact blocks using <sa_action type="create|update|delete" path="relative/path">content</sa_action>. Do not claim an action succeeded unless the block is valid.
+When you actually need to change workspace files, emit one or more exact blocks using <sa_action type="create|update|delete|patch" path="relative/path">content</sa_action>. Do not claim an action succeeded unless the block is valid.
 Example: <sa_action type="create" path="app/src/main/java/com/sa/app/Student.kt">package com.sa.app
 data class Student(val id: Long, val name: String)</sa_action>
 This example only demonstrates the tag syntax. It is Kotlin because the surrounding project is Kotlin — always use whatever language and file extension the user's actual request calls for (.py, .js, .java, .cpp, etc.), not just .kt.
+To change a few lines in a file that already exists, prefer type="patch" over retyping the whole file with type="update" — it is faster and far less likely to go wrong. Its content must be exactly:
+<<<<<<< FIND
+(exact existing text to find — must match only once)
+=======
+(replacement text)
+>>>>>>> REPLACE
+Only use type="update" when the file needs to change so much that a patch would not make sense.
 Always use this exact tag syntax to create or edit files. A plain ``` code fence is only for showing a snippet in the chat reply — it never updates the workspace, so any file the user asked for must also appear as an <sa_action> block.
+If the request needs more than one file: before writing any of them, first list the file paths you intend to create, one per line, in plain text (no tags, no code) — then write each one completely, one full <sa_action> block per file, before starting the next. Never mix two files' content into the same block, and never pad the end of your reply with a summary of what you "would" or "should" do next — either write it now as an <sa_action> block, or stop.
 Project: $projectName""" + if (webRequest) """
 
 The current user request below is asking for a WEBSITE / web app, not an Android app. Write plain HTML, CSS, and JavaScript files only, using extensions .html, .css, .js — for example <sa_action type="create" path="index.html">...</sa_action> and <sa_action type="create" path="style.css">...</sa_action>. Do NOT write Kotlin, do NOT use .kt paths, and do NOT reuse Compose/Activity/Fragment patterns for this request, even though the files listed in the project context are Kotlin — those belong to this app itself, not to the website being asked for.""" else ""
@@ -625,6 +642,43 @@ The current user request below is asking for a WEBSITE / web app, not an Android
         applyModelActions(raw)
     }
 
+    // ---- Fallback for when the model skips the <sa_action> protocol entirely ----------
+    // Small local models occasionally answer a request — especially a short, vague
+    // "continue" — in plain prose with ordinary markdown instead of the required
+    // <sa_action> tags: a heading or bold filename right before a normal ```lang fence,
+    // e.g. "### CSS (style.css)\n```css\n...\n```". applyModelActions() only ever looks
+    // for <sa_action> tags, so a response like that produces zero cards and saves
+    // nothing at all — which is exactly "continue karne par kuch nahi hota": the model
+    // did write real content, just not in the format the app parses. Only triggers when
+    // this turn produced no real <sa_action> blocks, and only recovers a fence that has
+    // an actual filename with a known extension immediately before it, so it can never
+    // misfire on a fence used to merely illustrate a snippet with no filename attached.
+    private val fencedFileRegex = Regex(
+        "([\\w][\\w\\-./]*\\.(?:html|css|js|kt|py|json|xml|md|ts|jsx|tsx|java))[\\s\\S]{0,60}?```[a-zA-Z0-9]*\\n([\\s\\S]*?)```",
+        RegexOption.IGNORE_CASE
+    )
+
+    private fun recoverFencedFiles(raw: String) {
+        if (fileCards.isNotEmpty()) return
+        var index = 0
+        var appliedAny = false
+        fencedFileRegex.findAll(raw).forEach { m ->
+            val path = m.groupValues[1].trim().trimStart('/')
+            val content = m.groupValues[2].trimEnd('\n', '\r')
+            if (content.isBlank() || content.length < 5) return@forEach
+            applyClosedAction("fb${index++}", "create", path, content)
+            appliedAny = true
+        }
+        if (appliedAny) {
+            addWorkLine(
+                "Recovered files from plain text",
+                "The response didn't use the <sa_action> format, so file(s) were recovered from its markdown code blocks instead. Double-check them — this path isn't as reliable as a normal generation.",
+                StepState.SUCCESS
+            )
+            saveFile()
+        }
+    }
+
     private fun completeStream() {
         synchronized(this) {
             if (generationFinished || generationCancelled) return
@@ -632,8 +686,9 @@ The current user request below is asking for a WEBSITE / web app, not an Android
         }
         viewModelScope.launch(Dispatchers.Main) {
             flushStreamBuffer(true)
-            val outChars = synchronized(rawStreamBuffer) { rawStreamBuffer.length }
-            lastOutputTokens = (outChars / 4).coerceAtLeast(0)
+            val raw = synchronized(rawStreamBuffer) { rawStreamBuffer.toString() }
+            recoverFencedFiles(raw)
+            lastOutputTokens = (raw.length / 4).coerceAtLeast(0)
             lastGenSeconds = (System.currentTimeMillis() - generationStartMs) / 1000.0
             // A max-token cutoff can end generation mid-tag; a card left STREAMING forever
             // would silently lie about still being in progress, so close it out here too.
@@ -666,11 +721,71 @@ The current user request below is asking for a WEBSITE / web app, not an Android
         }
     }
 
+    // Counts automatic reload-and-retry attempts for the CURRENT user turn only — reset
+    // to 0 in send() for every new message. Capped at 2 so a model that is genuinely
+    // broken (corrupt file, incompatible quantization, etc.) still surfaces a real error
+    // instead of retrying forever.
+    private var crashRetryCount = 0
+
     private fun failTask(message: String) {
         synchronized(this) {
             if (generationFinished || generationCancelled) return
             generationFinished = true
         }
+        // Reaching this point (past the guard above) means the native side reported a
+        // real error and it was NOT the user tapping Stop or Pause — both of those set
+        // generationCancelled first, which the guard above already filters out. In
+        // practice that almost always means the local model crashed or the runtime
+        // unloaded it mid-generation, not a deliberate stop. Try reloading the same
+        // model and continuing automatically a couple of times before giving up and
+        // showing the user a dead-end error screen.
+        if (crashRetryCount < 2 && modelPath.isNotBlank()) {
+            crashRetryCount++
+            val attempt = crashRetryCount
+            viewModelScope.launch(Dispatchers.Main) {
+                flushStreamBuffer(true)
+                // Same "don't lose the unfinished file" logic as the normal token-limit
+                // cutoff path (see completeStream) — a crash mid-file is just another way
+                // generation can stop before an <sa_action> block closes.
+                val cutOff = fileCards.firstOrNull { it.state == CardState.STREAMING }
+                pendingResume = cutOff?.let { it.path to it.liveContent }
+                markInterruptedCardsAsFailed()
+                addWorkLine(
+                    "Model stopped unexpectedly",
+                    "${message.ifBlank { "native error" }} — reloading the model and continuing automatically (attempt $attempt/2).",
+                    StepState.FAILED
+                )
+                val reloaded = withContext(Dispatchers.IO) {
+                    runCatching { LlamaBridge.initGenerateModel(modelPath) }.getOrDefault(false)
+                }
+                if (reloaded) {
+                    modelLoaded = true
+                    // The native session that "sessionActive" tracked died along with the
+                    // crash — the next call must start a fresh session rather than assume
+                    // continuity with a context that no longer exists.
+                    sessionActive = false
+                    // fileCards' ids are positional ("t0", "t1"...) within one raw buffer,
+                    // and the retry starts a brand new buffer from scratch — without this,
+                    // its id numbering would collide with and silently overwrite whatever
+                    // card already sat at "t0"/"t1" from before the crash. The actual
+                    // files already written are safe regardless (they're in `files`/disk,
+                    // not this list) — this only clears the chat's file-card display for
+                    // the retried portion.
+                    fileCards.clear()
+                    generationFinished = false
+                    generationJob = viewModelScope.launch { runAgent(taskTitle) }
+                } else {
+                    modelLoaded = false
+                    addWorkLine("Reload failed", "Could not reload the model — stopping.", StepState.FAILED)
+                    finishFailedTask(message)
+                }
+            }
+        } else {
+            finishFailedTask(message)
+        }
+    }
+
+    private fun finishFailedTask(message: String) {
         viewModelScope.launch(Dispatchers.Main) {
             flushStreamBuffer(true)
             val outChars = synchronized(rawStreamBuffer) { rawStreamBuffer.length }
@@ -1039,6 +1154,50 @@ The current user request below is asking for a WEBSITE / web app, not an Android
                     upsertFileCard(cardId, type, path, summary = "Deleted", state = CardState.DONE)
                 } else {
                     upsertFileCard(cardId, type, path, summary = "$path does not exist", state = CardState.FAILED)
+                }
+            }
+            // Search-and-replace edit: find a unique block of the file's CURRENT content
+            // and swap it for the replacement, instead of the model retyping the whole
+            // file just to change a few lines. Content is expected as:
+            //   <<<<<<< FIND
+            //   exact text to find (must match exactly once)
+            //   =======
+            //   replacement text
+            //   >>>>>>> REPLACE
+            // Chosen to look like a normal git merge-conflict block, which is a pattern
+            // small models have seen a huge amount of in training and reproduce fairly
+            // reliably — far more so than a hand-rolled tag format they've never seen.
+            "patch" -> {
+                val i = files.indexOfFirst { it.path == path }
+                if (i < 0) {
+                    upsertFileCard(cardId, type, path, summary = "$path does not exist — cannot patch", state = CardState.FAILED)
+                } else {
+                    val findMarker = "<<<<<<< FIND"
+                    val sepMarker = "======="
+                    val replaceMarker = ">>>>>>> REPLACE"
+                    val findIdx = content.indexOf(findMarker)
+                    val sepIdx = if (findIdx >= 0) content.indexOf(sepMarker, findIdx + findMarker.length) else -1
+                    val replaceIdx = if (sepIdx >= 0) content.indexOf(replaceMarker, sepIdx + sepMarker.length) else -1
+                    if (findIdx < 0 || sepIdx < 0 || replaceIdx < 0) {
+                        upsertFileCard(cardId, type, path, summary = "Malformed patch — missing FIND/=======/REPLACE markers", state = CardState.FAILED)
+                    } else {
+                        val findText = content.substring(findIdx + findMarker.length, sepIdx).trim('\n', '\r')
+                        val replaceText = content.substring(sepIdx + sepMarker.length, replaceIdx).trim('\n', '\r')
+                        val original = files[i].content
+                        val occurrences = if (findText.isEmpty()) 0 else Regex(Regex.escape(findText)).findAll(original).count()
+                        when {
+                            findText.isBlank() -> upsertFileCard(cardId, type, path, summary = "Empty FIND text", state = CardState.FAILED)
+                            occurrences == 0 -> upsertFileCard(cardId, type, path, summary = "FIND text not found in $path — nothing changed", state = CardState.FAILED)
+                            occurrences > 1 -> upsertFileCard(cardId, type, path, summary = "FIND text matched $occurrences places in $path — too ambiguous, nothing changed", state = CardState.FAILED)
+                            else -> {
+                                val updated = original.replaceFirst(findText, replaceText)
+                                files[i] = files[i].copy(content = updated)
+                                if (selectedFile == path) code = updated
+                                workspaceChangedThisTurn = true
+                                upsertFileCard(cardId, type, path, summary = "Patched, ${updated.lines().size} lines", state = CardState.DONE)
+                            }
+                        }
+                    }
                 }
             }
         }

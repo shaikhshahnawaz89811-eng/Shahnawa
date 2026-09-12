@@ -80,6 +80,7 @@ internal fun FileCardRow(vm: SAViewModel, card: FileCard) {
         "create" -> "Creating"
         "update" -> "Updating"
         "delete" -> "Deleting"
+        "patch" -> "Patching"
         else -> card.kind
     }
     Column(
