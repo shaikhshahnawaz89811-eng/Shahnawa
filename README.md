@@ -1,13 +1,23 @@
-# SA Offline Coding Assistant — v2.2.0
+# SA Offline Coding Assistant — v2.3.0
 
 This package is the fresh audited SA revision focused on a **Claude-like coding-chat work flow**, while keeping the supplied 15-panel image as the visual master reference.
+
+v2.3.0 redesigns how file generation is shown: earlier revisions rendered a single generic
+"Generate" line for an entire turn regardless of how many files it touched, and the chat text
+visibly stalled while an `<sa_action>` block streamed in. Now each file gets its own card the
+moment its opening tag appears, live content streams into it in place, and it collapses to a
+one-line summary once it finishes — see `docs/CARD_STREAMING_REDESIGN.md` for the full design
+and the reasoning behind it. Generic steps (Read workspace, Generate, Wiring, Verify) still
+render as the existing compact inline lines; only per-file activity is a card now.
 
 ## What is real in this revision
 
 - Persistent chat remains visible while work happens.
 - Local GGUF token streaming is rendered incrementally.
 - Streaming is UI-micro-batched for smoothness; it is not simulated token animation.
-- Work activity is shown as compact inline text lines. Tap a line to expand its real detail; there is no large fake progress card.
+- Generic step activity (Read workspace, Generate, Wiring, Verify) is shown as compact inline text lines; tap a line to expand its real detail.
+- Each file create/update/delete gets its own live card the moment its action tag opens, showing real streamed content in a height-capped, scrollable preview, and collapsing to a one-line summary once it finishes. Nothing renders before there is real model output behind it, and no card is invented for a turn that touched no files.
+- After a turn's file actions finish, Wiring runs a best-effort local check of imports and AndroidManifest entries across the files that were touched. It is a static heuristic over in-memory files, not a compiler or a build.
 - Validated model action envelopes can create, update, or delete workspace files.
 - File actions are path-safe and size-bounded.
 - The visible assistant response hides internal action markup.

@@ -1,0 +1,871 @@
+package com.sa.assistant
+
+import android.app.Application
+import android.content.Context
+import android.net.Uri
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.llamatik.library.platform.GenStream
+import com.llamatik.library.platform.LlamaBridge
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+
+internal class SAViewModel(app: Application) : AndroidViewModel(app) {
+    private val prefs = app.getSharedPreferences("sa_state", Context.MODE_PRIVATE)
+
+    // ---- Screen / composer / task state -----------------------------------
+    var screen by mutableStateOf(Screen.CHAT)
+    var input by mutableStateOf("")
+    var projectName by mutableStateOf(prefs.getString("project", "MyApp") ?: "MyApp")
+    var selectedFile by mutableStateOf("")
+    var code by mutableStateOf("")
+    var modelPath by mutableStateOf(prefs.getString("modelPath", "") ?: "")
+    var modelName by mutableStateOf(prefs.getString("modelName", "No GGUF model loaded") ?: "No GGUF model loaded")
+    var modelLoaded by mutableStateOf(false)
+    var modelMeta by mutableStateOf("Import an instruction-tuned GGUF model")
+    var taskTitle by mutableStateOf("")
+    var errorText by mutableStateOf("")
+    var isWorking by mutableStateOf(false)
+    var isPaused by mutableStateOf(false)
+    var editingId by mutableStateOf<Long?>(null)
+    var editedText by mutableStateOf("")
+    var showComposerMenu by mutableStateOf(false)
+    var sessionActive by mutableStateOf(false)
+    var lastTaskSaved by mutableStateOf(false)
+    var expandedWorkLineId by mutableStateOf<Long?>(null)
+    var expandedFileCardId by mutableStateOf<String?>(null)
+    var validationText by mutableStateOf("Workspace not validated")
+    var attachmentContext by mutableStateOf("")
+
+    val messages = mutableStateListOf<ChatMessage>()
+    val files = mutableStateListOf<ProjectFile>()
+    val attachments = mutableStateListOf<Attachment>()
+    val workLines = mutableStateListOf<WorkLine>()
+
+    // One entry per <sa_action> block seen so far this turn — created the moment its
+    // opening tag streams in, updated live while it streams, finalized when it closes.
+    // See applyModelActions() below for how these are populated.
+    val fileCards = mutableStateListOf<FileCard>()
+
+    // Chat renders WorkLines and FileCards as one merged, time-ordered list so a file
+    // card shows up exactly where it really happened relative to the generic steps
+    // around it, instead of two separate blocks that drift out of true order.
+    val timeline: List<TimelineItem>
+        get() = (workLines.map { TimelineItem.Line(it) } + fileCards.map { TimelineItem.Card(it) }).sortedBy { it.seq }
+
+    // Single live line for the header subtitle. Only ever describes something that is
+    // actually true right now — it reads off the same state the timeline renders from,
+    // it does not invent its own "phase" tracking.
+    val statusLabel: String
+        get() {
+            fileCards.firstOrNull { it.state == CardState.STREAMING }?.let {
+                return "Writing ${it.path.substringAfterLast('/')}"
+            }
+            workLines.lastOrNull { it.state == StepState.RUNNING }?.let { return it.title }
+            return if (isWorking) "Working" else if (modelLoaded) modelName else "Offline AI Coding Assistant"
+        }
+
+    private var generationJob: Job? = null
+    private var flushJob: Job? = null
+    private var persistJob: Job? = null
+    private val streamBuffer = StringBuilder()
+    private val rawStreamBuffer = StringBuilder()
+    private var streamMessageId: Long? = null
+    private var generationWorkLineId: Long? = null
+    private var generationFinished = false
+    private var generationCancelled = false
+    private val processedActionKeys = mutableSetOf<String>()
+    // Set true only when a create/update/delete action actually mutates `files` this turn.
+    // completeStream() checks this to decide whether an auto-zip snapshot and a wiring
+    // check are worth running.
+    private var workspaceChangedThisTurn = false
+
+    // Open tag alone (no closing tag required) — this is what lets a file card appear
+    // the moment the model starts a file, instead of only once it finishes. The full
+    // block regex below is unchanged from before and is still what actually applies a
+    // file mutation; nothing is written to `files` until a block fully closes.
+    private val openActionRegex = Regex(
+        """<sa_action\s+type="(create|update|delete)"\s+path="([^"]+)">""",
+        RegexOption.IGNORE_CASE
+    )
+    private val closeActionRegex = Regex(
+        """<sa_action\s+type="(create|update|delete)"\s+path="([^"]+)">(.*?)</sa_action>""",
+        setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE)
+    )
+
+    init {
+        restoreState()
+        if (files.isEmpty()) loadStarter()
+        if (selectedFile.isBlank() && files.isNotEmpty()) {
+            selectedFile = files.first().path
+            code = files.first().content
+        }
+    }
+
+    // ---- Persistence --------------------------------------------------------
+    private fun restoreState() {
+        try {
+            val rawMessages = prefs.getString("messages", null)
+            if (!rawMessages.isNullOrBlank()) {
+                val arr = JSONArray(rawMessages)
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    messages += ChatMessage(o.getLong("id"), o.getBoolean("user"), o.getString("text"), false)
+                }
+            }
+            val rawFiles = prefs.getString("files", null)
+            if (!rawFiles.isNullOrBlank()) {
+                val arr = JSONArray(rawFiles)
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    files += ProjectFile(o.getString("path"), o.getString("content"))
+                }
+            }
+            selectedFile = prefs.getString("selectedFile", "") ?: ""
+            code = files.firstOrNull { it.path == selectedFile }?.content.orEmpty()
+            taskTitle = prefs.getString("taskTitle", "") ?: ""
+            lastTaskSaved = prefs.getBoolean("taskSaved", false)
+            validationText = prefs.getString("validation", "Workspace not validated") ?: "Workspace not validated"
+            val rawWork = prefs.getString("workLines", null)
+            if (!rawWork.isNullOrBlank()) {
+                val arr = JSONArray(rawWork)
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val state = runCatching { StepState.valueOf(o.getString("state")) }.getOrDefault(StepState.WAITING)
+                    workLines += WorkLine(o.getLong("id"), o.getString("title"), o.getString("detail"), state, o.optBoolean("expandable", true))
+                }
+            }
+            val rawCards = prefs.getString("fileCards", null)
+            if (!rawCards.isNullOrBlank()) {
+                val arr = JSONArray(rawCards)
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    val state = runCatching { CardState.valueOf(o.getString("state")) }.getOrDefault(CardState.DONE)
+                    // A card only reaches disk between turns, so STREAMING here means the
+                    // process died mid-generation, not that it is still in progress.
+                    val safeState = if (state == CardState.STREAMING) CardState.FAILED else state
+                    val summary = if (state == CardState.STREAMING) "Interrupted before completion" else o.getString("summary")
+                    fileCards += FileCard(o.getString("id"), o.getLong("seq"), o.getString("kind"), o.getString("path"), summary = summary, state = safeState)
+                }
+            }
+        } catch (_: Throwable) {
+            messages.clear()
+            files.clear()
+        }
+    }
+
+    private fun persistState() {
+        // Snapshot on the UI thread; JSON serialization and disk I/O stay off the UI thread.
+        val projectSnapshot = projectName
+        val messageSnapshot = messages.toList()
+        val fileSnapshot = files.toList()
+        val workSnapshot = workLines.toList()
+        val cardSnapshot = fileCards.toList()
+        val selectedSnapshot = selectedFile
+        val taskSnapshot = taskTitle
+        val taskSavedSnapshot = lastTaskSaved
+        val modelPathSnapshot = modelPath
+        val modelNameSnapshot = modelName
+        val validationSnapshot = validationText
+        persistJob?.cancel()
+        persistJob = viewModelScope.launch(Dispatchers.IO) {
+            val m = JSONArray()
+            messageSnapshot.forEach { m.put(JSONObject().apply { put("id", it.id); put("user", it.user); put("text", it.text) }) }
+            val f = JSONArray()
+            fileSnapshot.forEach { f.put(JSONObject().apply { put("path", it.path); put("content", it.content) }) }
+            val w = JSONArray()
+            workSnapshot.forEach { w.put(JSONObject().apply { put("id", it.id); put("title", it.title); put("detail", it.detail); put("state", it.state.name); put("expandable", it.expandable) }) }
+            val c = JSONArray()
+            cardSnapshot.forEach {
+                c.put(JSONObject().apply {
+                    put("id", it.id); put("seq", it.seq); put("kind", it.kind); put("path", it.path)
+                    put("summary", it.summary); put("state", it.state.name)
+                    // liveContent is intentionally not persisted: it only means anything while
+                    // a card is still streaming, and persistState() only ever runs at a turn
+                    // boundary, never mid-stream.
+                })
+            }
+            prefs.edit()
+                .putString("project", projectSnapshot)
+                .putString("messages", m.toString())
+                .putString("files", f.toString())
+                .putString("workLines", w.toString())
+                .putString("fileCards", c.toString())
+                .putString("selectedFile", selectedSnapshot)
+                .putString("taskTitle", taskSnapshot)
+                .putBoolean("taskSaved", taskSavedSnapshot)
+                .putString("modelPath", modelPathSnapshot)
+                .putString("modelName", modelNameSnapshot)
+                .putString("validation", validationSnapshot)
+                .apply()
+        }
+    }
+
+    // ---- Lifecycle / starter -------------------------------------------------
+    private fun loadStarter() {
+        files.clear()
+        files.addAll(starterFiles(projectName))
+        selectedFile = files.first().path
+        code = files.first().content
+        messages.clear()
+        messages += ChatMessage(1L, false, "Hello, I'm SA\n\nYour offline AI coding assistant.\n\nLoad a local instruction-tuned GGUF model to enable real token streaming. Your project files and chat state stay on this device.")
+        persistState()
+    }
+
+    fun selectFile(path: String) {
+        saveFile()
+        selectedFile = path
+        code = files.firstOrNull { it.path == path }?.content.orEmpty()
+        screen = Screen.CODE
+    }
+
+    // Opens the editor already pointed at a specific file card — used when tapping a
+    // card in the chat timeline instead of navigating via the Files list.
+    fun openFileCard(card: FileCard) {
+        if (card.state != CardState.STREAMING) selectFile(card.path) else {
+            selectedFile = card.path
+            screen = Screen.CODE
+        }
+    }
+
+    fun saveFile() {
+        val i = files.indexOfFirst { it.path == selectedFile }
+        if (i >= 0) files[i] = files[i].copy(content = code)
+        persistState()
+    }
+
+    fun newProject(name: String) {
+        stopGeneration()
+        projectName = name.trim().ifBlank { "NewProject" }
+        files.clear()
+        files.addAll(starterFiles(projectName))
+        selectedFile = files.first().path
+        code = files.first().content
+        messages.clear()
+        messages += ChatMessage(System.currentTimeMillis(), false, "Project $projectName created. The workspace contains real editable files.")
+        workLines.clear()
+        fileCards.clear()
+        taskTitle = ""
+        lastTaskSaved = false
+        sessionActive = false
+        runCatching { LlamaBridge.sessionReset() }
+        persistState()
+        screen = Screen.CHAT
+    }
+
+    fun importModel(context: Context, uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val dir = File(context.filesDir, "models").apply { mkdirs() }
+                val name = (uri.lastPathSegment?.substringAfterLast('/') ?: "model.gguf")
+                    .replace(Regex("[^A-Za-z0-9._-]"), "_")
+                val target = File(dir, name)
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(target).use { output -> input.copyTo(output, 1024 * 1024) }
+                } ?: error("Unable to open selected model")
+                withContext(Dispatchers.Main) {
+                    modelPath = target.absolutePath
+                    modelName = name
+                    modelMeta = "Imported locally • ${target.length() / (1024 * 1024)} MB • loading…"
+                    prefs.edit().putString("modelPath", modelPath).putString("modelName", modelName).apply()
+                }
+                loadModel(target.absolutePath)
+            } catch (e: Throwable) {
+                withContext(Dispatchers.Main) { modelLoaded = false; modelMeta = "Model import failed: ${e.message ?: "unknown error"}" }
+            }
+        }
+    }
+
+    private fun loadModel(path: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                LlamaBridge.updateGenerateParams(
+                    temperature = 0.35f,
+                    maxTokens = 1024,
+                    topP = 0.90f,
+                    topK = 40,
+                    repeatPenalty = 1.08f,
+                    contextLength = 4096,
+                    numThreads = maxOf(2, (Runtime.getRuntime().availableProcessors() - 2).coerceAtMost(6)),
+                    useMmap = true,
+                    flashAttention = false,
+                    batchSize = 256,
+                    gpuLayers = 0
+                )
+                runCatching { LlamaBridge.shutdown() }
+                val ok = LlamaBridge.initGenerateModel(path)
+                val type = runCatching { LlamaBridge.getModelFinetuneType() }.getOrNull()
+                withContext(Dispatchers.Main) {
+                    modelLoaded = ok
+                    sessionActive = false
+                    modelMeta = if (ok) {
+                        "Loaded • ${type ?: "unknown/base"} • context 4096 • mmap"
+                    } else "Model load failed"
+                }
+            } catch (e: Throwable) {
+                withContext(Dispatchers.Main) { modelLoaded = false; modelMeta = "Load failed: ${e.message ?: "native error"}" }
+            }
+        }
+    }
+
+    // ---- Sending / generation --------------------------------------------------
+    fun send() {
+        val text = input.trim()
+        if (text.isEmpty() || isWorking) return
+        saveFile()
+        streamMessageId = null
+        messages += ChatMessage(System.currentTimeMillis(), true, text)
+        input = ""
+        taskTitle = text
+        lastTaskSaved = false
+        errorText = ""
+        workLines.clear()
+        fileCards.clear()
+        persistState()
+        if (!modelLoaded) {
+            errorText = "No local GGUF model is loaded. Open Settings → Model and import an instruction-tuned GGUF file."
+            isWorking = false
+            lastTaskSaved = false
+            workLines += WorkLine(System.nanoTime(), "Model required", errorText, StepState.FAILED)
+            persistState()
+            screen = Screen.ERROR
+            return
+        }
+        isWorking = true
+        isPaused = false
+        screen = Screen.CHAT
+        generationFinished = false
+        generationCancelled = false
+        processedActionKeys.clear()
+        workspaceChangedThisTurn = false
+        generationJob = viewModelScope.launch { runAgent(text) }
+    }
+
+    private suspend fun runAgent(user: String) {
+        try {
+            val context = buildContext()
+            addWorkLine("Read workspace", "Loaded ${files.size} project files and bounded each file to the phone-safe context budget.", StepState.SUCCESS)
+            addWorkLine("Prepare task context", "Prepared conversation history, project files, and the current user request.", StepState.SUCCESS)
+            generationWorkLineId = addWorkLine("Generate", "Local GGUF generation started. Tokens will appear directly in the assistant response.", StepState.RUNNING)
+            streamAgent(user, context)
+        } catch (e: Throwable) {
+            failTask(e.message ?: "Generation failed")
+        }
+    }
+
+    private fun addWorkLine(title: String, detail: String, state: StepState): Long {
+        val id = System.nanoTime()
+        workLines += WorkLine(id, title, detail, state)
+        return id
+    }
+
+    private suspend fun streamAgent(user: String, context: String) {
+        val system = """You are SA, an offline coding assistant. This project happens to be Android/Kotlin, but you are not limited to Kotlin — if the user asks for code in Python, Java, JavaScript, C++, or any other language, write it in that language and give the file the matching extension.
+Never claim a file was changed, a build passed, or an app was installed unless SA actually performed that operation.
+Inspect first. Explain root cause before proposing a fix. Prefer minimal, connected changes. Keep answers concise but useful.
+When you actually need to change workspace files, emit one or more exact blocks using <sa_action type="create|update|delete" path="relative/path">content</sa_action>. Do not claim an action succeeded unless the block is valid.
+Example: <sa_action type="create" path="app/src/main/java/com/sa/app/Student.kt">package com.sa.app
+data class Student(val id: Long, val name: String)</sa_action>
+This example only demonstrates the tag syntax. It is Kotlin because the surrounding project is Kotlin — always use whatever language and file extension the user's actual request calls for (.py, .js, .java, .cpp, etc.), not just .kt.
+Always use this exact tag syntax to create or edit files. A plain ``` code fence is only for showing a snippet in the chat reply — it never updates the workspace, so any file the user asked for must also appear as an <sa_action> block.
+Project: $projectName"""
+        val history = recentHistory()
+        val prompt = "Conversation:\n$history\n\nCurrent project context:\n$context\n\nAttachment context:\n$attachmentContext\n\nUser request:\n$user"
+
+        val assistantId = System.currentTimeMillis()
+        messages += ChatMessage(assistantId, false, "", true)
+        streamMessageId = assistantId
+        synchronized(streamBuffer) { streamBuffer.setLength(0) }
+        synchronized(rawStreamBuffer) { rawStreamBuffer.setLength(0) }
+
+        withContext(Dispatchers.IO) {
+            try {
+                val callback = object : GenStream {
+                    override fun onDelta(text: String) = appendStream(text)
+                    override fun onComplete() = completeStream()
+                    override fun onError(message: String) = failTask(message)
+                }
+                if (sessionActive) {
+                    LlamaBridge.generateContinueStream(prompt, callback)
+                } else {
+                    LlamaBridge.generateWithContextStream(
+                        system,
+                        context + "\n\n" + history,
+                        user,
+                        onDelta = { text -> appendStream(text) },
+                        onDone = { completeStream() },
+                        onError = { message -> failTask(message) }
+                    )
+                }
+            } catch (e: Throwable) {
+                failTask(e.message ?: "Native generation failed")
+            }
+        }
+    }
+
+    private fun appendStream(text: String) {
+        if (generationCancelled || generationFinished) return
+        synchronized(streamBuffer) { streamBuffer.append(text) }
+        synchronized(rawStreamBuffer) { rawStreamBuffer.append(text) }
+        // Native callbacks can be much faster than Compose can render. Keep callbacks off the
+        // UI thread and coalesce them into one bounded UI update roughly every 35 ms.
+        if (flushJob?.isActive != true) {
+            flushJob = viewModelScope.launch(Dispatchers.Main.immediate) {
+                delay(35)
+                flushStreamBuffer(false)
+            }
+        }
+    }
+
+    private fun flushStreamBuffer(force: Boolean) {
+        flushJob = null
+        val chunk = synchronized(streamBuffer) {
+            if (streamBuffer.isEmpty()) "" else streamBuffer.toString().also { streamBuffer.setLength(0) }
+        }
+        if (chunk.isEmpty() && !force) return
+        val id = streamMessageId ?: return
+        val index = messages.indexOfFirst { it.id == id }
+        // Recompute the visible text from the FULL raw buffer every tick, not from
+        // (previously shown text + this delta). old.text is already-stripped output;
+        // feeding it back into visibleResponse() together with only the newest raw
+        // delta silently drops whatever was cut out earlier (e.g. an in-progress
+        // <sa_action> block) and glues unrelated fragments together with no space —
+        // that's what produced merged words, missing line breaks, and a stray
+        // "</sa_action>" leaking into the bubble. The raw buffer already holds the
+        // complete text since this message started, so always derive from it.
+        val raw = synchronized(rawStreamBuffer) { rawStreamBuffer.toString() }
+        if (index >= 0 && chunk.isNotEmpty()) {
+            val old = messages[index]
+            messages[index] = old.copy(text = visibleResponse(raw))
+        }
+        // Parse in-progress and completed SA file-action blocks only on the coalesced UI
+        // tick. This avoids launching a main-thread coroutine for every native token.
+        applyModelActions(raw)
+    }
+
+    private fun completeStream() {
+        synchronized(this) {
+            if (generationFinished || generationCancelled) return
+            generationFinished = true
+        }
+        viewModelScope.launch(Dispatchers.Main) {
+            flushStreamBuffer(true)
+            // A max-token cutoff can end generation mid-tag; a card left STREAMING forever
+            // would silently lie about still being in progress, so close it out here too.
+            markInterruptedCardsAsFailed()
+            generationWorkLineId?.let { id ->
+                val i = workLines.indexOfFirst { it.id == id }
+                if (i >= 0) workLines[i] = workLines[i].copy(state = StepState.SUCCESS, detail = "Generation completed and the response was finalized.")
+            }
+            if (workspaceChangedThisTurn) checkWiring()
+            addWorkLine("Verify", "Response state, generated actions, and workspace persistence were finalized.", StepState.SUCCESS)
+            if (workspaceChangedThisTurn) autoExportZip()
+            messages.indexOfFirst { it.id == streamMessageId }.takeIf { it >= 0 }?.let { i -> messages[i] = messages[i].copy(streaming = false) }
+            isWorking = false
+            sessionActive = true
+            generationJob = null
+            lastTaskSaved = true
+            persistState()
+            screen = Screen.CHAT
+        }
+    }
+
+    private fun failTask(message: String) {
+        synchronized(this) {
+            if (generationFinished || generationCancelled) return
+            generationFinished = true
+        }
+        viewModelScope.launch(Dispatchers.Main) {
+            flushStreamBuffer(true)
+            markInterruptedCardsAsFailed()
+            generationWorkLineId?.let { id ->
+                val i = workLines.indexOfFirst { it.id == id }
+                if (i >= 0) workLines[i] = workLines[i].copy(state = StepState.FAILED, detail = message)
+            }
+            val id = streamMessageId
+            if (id != null) {
+                val index = messages.indexOfFirst { it.id == id }
+                if (index >= 0) {
+                    messages[index] = messages[index].copy(text = messages[index].text.ifBlank { "Generation failed: $message" }, streaming = false)
+                }
+            } else {
+                messages += ChatMessage(System.currentTimeMillis(), false, "Generation failed: $message")
+            }
+            errorText = message
+            isWorking = false
+            generationJob = null
+            lastTaskSaved = false
+            persistState()
+            screen = Screen.ERROR
+        }
+    }
+
+    fun pause() {
+        if (!isWorking) return
+        isPaused = true
+        generationCancelled = true
+        runCatching { LlamaBridge.nativeCancelGenerate() }
+        markInterruptedCardsAsFailed()
+        generationWorkLineId?.let { id ->
+            val i = workLines.indexOfFirst { it.id == id }
+            if (i >= 0) workLines[i] = workLines[i].copy(state = StepState.PAUSED, detail = "Generation cancelled safely; resume can continue from the task prompt.")
+        }
+        persistState()
+        screen = Screen.PAUSE
+    }
+
+    fun resume() {
+        if (!isPaused) return
+        isPaused = false
+        isWorking = false
+        input = taskTitle
+        screen = Screen.CHAT
+    }
+
+    fun stopGeneration() {
+        generationCancelled = true
+        runCatching { LlamaBridge.nativeCancelGenerate() }
+        generationJob?.cancel()
+        generationJob = null
+        flushJob?.cancel()
+        flushStreamBuffer(true)
+        markInterruptedCardsAsFailed()
+        isWorking = false
+        isPaused = false
+        generationJob = null
+        messages.indexOfFirst { it.streaming }.takeIf { it >= 0 }?.let { i -> messages[i] = messages[i].copy(streaming = false) }
+        persistState()
+    }
+
+    fun edit(message: ChatMessage) {
+        if (!message.user) return
+        editingId = message.id
+        editedText = message.text
+        screen = Screen.EDIT
+    }
+
+    fun saveEdit() {
+        val id = editingId ?: return
+        val i = messages.indexOfFirst { it.id == id }
+        if (i >= 0) {
+            messages[i] = messages[i].copy(text = editedText.trim())
+            sessionActive = false
+            runCatching { LlamaBridge.sessionReset() }
+            if (i < messages.lastIndex) {
+                while (messages.lastIndex > i) messages.removeAt(messages.lastIndex)
+            }
+        }
+        persistState()
+        screen = Screen.CHAT
+    }
+
+    fun addAttachment(uri: Uri, name: String) {
+        showComposerMenu = false
+        viewModelScope.launch(Dispatchers.IO) {
+            val content = runCatching {
+                val resolver = getApplication<Application>().contentResolver
+                val type = resolver.getType(uri).orEmpty()
+                if (type.startsWith("text/") || type == "application/json" || name.endsWith(".md", true) || name.endsWith(".kt", true) || name.endsWith(".gradle", true) || name.endsWith(".kts", true)) {
+                    resolver.openInputStream(uri)?.bufferedReader()?.use { it.readText().take(120_000) }.orEmpty()
+                } else if (type == "application/zip" || name.endsWith(".zip", true)) {
+                    resolver.openInputStream(uri)?.use { input ->
+                        java.util.zip.ZipInputStream(input).use { zip ->
+                            buildString {
+                                var entry = zip.nextEntry
+                                var count = 0
+                                while (entry != null && count < 100) {
+                                    if (!entry.isDirectory) append(entry.name).append('\n')
+                                    count++
+                                    entry = zip.nextEntry
+                                }
+                            }.take(20_000)
+                        }
+                    }.orEmpty()
+                } else ""
+            }.getOrDefault("")
+            withContext(Dispatchers.Main) {
+                attachments += Attachment(uri.toString(), name, if (content.isBlank()) "binary" else "text")
+                if (content.isNotBlank()) {
+                    attachmentContext = (attachmentContext + "\nATTACHMENT: $name\n$content").takeLast(180_000)
+                }
+            }
+        }
+    }
+
+    fun exportZip(context: Context, uri: Uri) {
+        saveFile()
+        val exportFiles = files.toList()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                context.contentResolver.openOutputStream(uri)?.use { output ->
+                    ZipOutputStream(output).use { zip ->
+                        exportFiles.forEach { f ->
+                            zip.putNextEntry(ZipEntry(f.path))
+                            zip.write(f.content.toByteArray())
+                            zip.closeEntry()
+                        }
+                    }
+                } ?: error("Unable to create destination file")
+                withContext(Dispatchers.Main) { screen = Screen.ZIP }
+            } catch (e: Throwable) {
+                withContext(Dispatchers.Main) { errorText = "ZIP export failed: ${e.message ?: "unknown error"}"; screen = Screen.ERROR }
+            }
+        }
+    }
+
+    // Auto-zip runs with no user gesture, so it can't use the CreateDocument picker
+    // exportZip() uses (Android requires a tap for that). It writes into this app's
+    // own external-files directory instead — no runtime permission needed, and it's
+    // a separate, additional snapshot; the manual Export ZIP screen is unchanged.
+    private fun autoExportZip() {
+        val exportFiles = files.toList()
+        if (exportFiles.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val dir = File(getApplication<Application>().getExternalFilesDir(null), "auto_zips")
+                dir.mkdirs()
+                val target = File(dir, "${projectName}_${System.currentTimeMillis()}.zip")
+                FileOutputStream(target).use { output ->
+                    ZipOutputStream(output).use { zip ->
+                        exportFiles.forEach { f ->
+                            zip.putNextEntry(ZipEntry(f.path))
+                            zip.write(f.content.toByteArray())
+                            zip.closeEntry()
+                        }
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    addWorkLine("Auto-saved ZIP", "Saved ${exportFiles.size} files to ${target.absolutePath}", StepState.SUCCESS)
+                }
+            } catch (e: Throwable) {
+                withContext(Dispatchers.Main) {
+                    addWorkLine("Auto ZIP failed", e.message ?: "unknown error", StepState.FAILED)
+                }
+            }
+        }
+    }
+
+    fun resumeLater() {
+        lastTaskSaved = true
+        persistState()
+        screen = Screen.CHAT
+    }
+
+    fun toggleWorkLine(id: Long) {
+        expandedWorkLineId = if (expandedWorkLineId == id) null else id
+    }
+
+    fun toggleFileCard(id: String) {
+        expandedFileCardId = if (expandedFileCardId == id) null else id
+    }
+
+    fun validateWorkspace() {
+        val problems = mutableListOf<String>()
+        if (projectName.isBlank()) problems += "Project name is empty"
+        if (files.isEmpty()) problems += "No project files"
+        if (files.none { it.path == "settings.gradle.kts" }) problems += "settings.gradle.kts is missing"
+        if (files.none { it.path == "build.gradle.kts" }) problems += "root build.gradle.kts is missing"
+        if (files.none { it.path == "app/build.gradle.kts" }) problems += "app/build.gradle.kts is missing"
+        if (files.none { it.path == "app/src/main/AndroidManifest.xml" }) problems += "AndroidManifest.xml is missing"
+        if (files.none { it.path == "app/src/main/res/values/styles.xml" }) problems += "styles.xml is missing"
+        if (files.any { it.path.startsWith("/") || it.path.split('/').contains("..") }) problems += "Unsafe file path detected"
+        validationText = if (problems.isEmpty()) "Workspace validation passed • ${files.size} files" else "Validation failed • ${problems.joinToString("; ")}"
+        persistState()
+    }
+
+    private fun safeWorkspacePath(path: String): Boolean = path.isNotBlank() && !path.startsWith("/") && !path.split('/').contains("..") && path.length <= 240
+
+    // ---- Streaming action parsing --------------------------------------------
+    // Runs on every coalesced UI tick against the FULL raw buffer for this turn.
+    // Every <sa_action> opening tag found gets a card the moment it appears, keyed by
+    // its position in this tick's match list ("t0", "t1", ...). Because raw only ever
+    // grows during one turn, that position is stable across ticks for the same block,
+    // so re-scanning from scratch each time is safe and keeps this stateless.
+    private fun applyModelActions(raw: String) {
+        val opens = openActionRegex.findAll(raw).toList()
+        if (opens.isEmpty()) return
+        val closes = closeActionRegex.findAll(raw).toList()
+        var appliedAny = false
+
+        opens.forEachIndexed { index, openMatch ->
+            val cardId = "t$index"
+            val type = openMatch.groupValues[1].lowercase()
+            val path = openMatch.groupValues[2]
+            val closeMatch = closes.firstOrNull { it.range.first == openMatch.range.first }
+
+            if (closeMatch != null) {
+                // Fully streamed in. processedActionKeys still guards the actual file
+                // mutation so a re-scan on the next tick can never apply it twice.
+                if (processedActionKeys.add(closeMatch.value)) {
+                    applyClosedAction(cardId, type, path, closeMatch.groupValues[3].trimStart('\n', '\r'))
+                    appliedAny = true
+                }
+            } else {
+                // Still streaming: live content is whatever has arrived since the tag
+                // opened, capped at the next action's opening tag if one has already
+                // started (defensive only — the model is instructed to close each
+                // block before starting another).
+                val contentStart = openMatch.range.last + 1
+                val nextOpenStart = opens.getOrNull(index + 1)?.range?.first ?: raw.length
+                val live = raw.substring(contentStart, nextOpenStart.coerceAtLeast(contentStart)).trimStart('\n', '\r')
+                upsertFileCard(cardId, type, path, liveContent = live, state = CardState.STREAMING)
+            }
+        }
+        // Disk persistence only follows an actual applied mutation, exactly like before
+        // this change — not every tick, which for a multi-second file write would mean
+        // dozens of redundant writes for a card update that only touches in-memory state.
+        if (appliedAny) saveFile()
+    }
+
+    // Replaces (or creates) the card for `id`, preserving its original `seq` — the
+    // position where it first appeared — across every later update so a card never
+    // jumps position in the timeline once it starts streaming.
+    private fun upsertFileCard(id: String, kind: String, path: String, liveContent: String = "", summary: String = "", state: CardState) {
+        val i = fileCards.indexOfFirst { it.id == id }
+        if (i >= 0) {
+            fileCards[i] = fileCards[i].copy(kind = kind, path = path, liveContent = liveContent, summary = summary, state = state)
+        } else {
+            fileCards += FileCard(id, System.nanoTime(), kind, path, liveContent, summary, state)
+        }
+    }
+
+    private fun applyClosedAction(cardId: String, type: String, path: String, content: String) {
+        if (!safeWorkspacePath(path) || content.length > 200_000) {
+            upsertFileCard(cardId, type, path, summary = "Unsafe path or oversized content", state = CardState.FAILED)
+            return
+        }
+        when (type) {
+            "create" -> {
+                if (files.any { it.path == path }) {
+                    upsertFileCard(cardId, type, path, summary = "$path already exists", state = CardState.FAILED)
+                } else {
+                    files += ProjectFile(path, content)
+                    workspaceChangedThisTurn = true
+                    upsertFileCard(cardId, type, path, summary = "Created, ${content.lines().size} lines", state = CardState.DONE)
+                }
+            }
+            "update" -> {
+                val i = files.indexOfFirst { it.path == path }
+                if (i < 0) {
+                    upsertFileCard(cardId, type, path, summary = "$path does not exist", state = CardState.FAILED)
+                } else {
+                    files[i] = files[i].copy(content = content)
+                    if (selectedFile == path) code = content
+                    workspaceChangedThisTurn = true
+                    upsertFileCard(cardId, type, path, summary = "Updated, ${content.lines().size} lines", state = CardState.DONE)
+                }
+            }
+            "delete" -> {
+                val removed = files.removeAll { it.path == path }
+                if (removed) {
+                    if (selectedFile == path) {
+                        selectedFile = files.firstOrNull()?.path.orEmpty()
+                        code = files.firstOrNull()?.content.orEmpty()
+                    }
+                    workspaceChangedThisTurn = true
+                    upsertFileCard(cardId, type, path, summary = "Deleted", state = CardState.DONE)
+                } else {
+                    upsertFileCard(cardId, type, path, summary = "$path does not exist", state = CardState.FAILED)
+                }
+            }
+        }
+    }
+
+    // Safety net for generation that stops (cancel, error, or a max-token cutoff) while
+    // a card is still STREAMING. Without this a card could sit showing "Writing…"
+    // forever even though nothing will ever update it again.
+    private fun markInterruptedCardsAsFailed() {
+        fileCards.forEachIndexed { i, card ->
+            if (card.state == CardState.STREAMING) {
+                fileCards[i] = card.copy(state = CardState.FAILED, summary = "Interrupted before completion")
+            }
+        }
+    }
+
+    // Best-effort, local, static check — not a compiler and not a build. It only looks at
+    // import lines, top-level class/object names, and plain substring matches against
+    // AndroidManifest.xml, entirely from files already held in memory. It is named and
+    // worded so it never overstates what it actually verified.
+    private fun checkWiring() {
+        val touched = fileCards.filter { it.state == CardState.DONE }
+        if (touched.isEmpty()) return
+
+        val kotlinFiles = files.filter { it.path.endsWith(".kt") }
+        val classOf = kotlinFiles.associate { f ->
+            f.path to (Regex("""\b(?:class|object)\s+(\w+)""").find(f.content)?.groupValues?.get(1)
+                ?: f.path.substringAfterLast('/').removeSuffix(".kt"))
+        }
+        val packageOf = kotlinFiles.associate { f ->
+            f.path to (Regex("""^\s*package\s+([\w.]+)""", RegexOption.MULTILINE).find(f.content)?.groupValues?.get(1).orEmpty())
+        }
+        val manifest = files.firstOrNull { it.path.endsWith("AndroidManifest.xml") }?.content.orEmpty()
+
+        var connections = 0
+        val warnings = mutableListOf<String>()
+
+        touched.filter { it.kind != "delete" && it.path.endsWith(".kt") }.forEach { card ->
+            val file = files.firstOrNull { it.path == card.path } ?: return@forEach
+            Regex("""^\s*import\s+([\w.]+)""", RegexOption.MULTILINE).findAll(file.content).forEach { m ->
+                val imported = m.groupValues[1]
+                val importedClass = imported.substringAfterLast('.')
+                val matched = classOf.entries.firstOrNull { it.value == importedClass && it.key != card.path }
+                when {
+                    matched != null -> connections++
+                    packageOf.values.any { it.isNotBlank() && imported.startsWith(it) } ->
+                        warnings += "${card.path.substringAfterLast('/')} imports $imported but no matching file was found"
+                }
+            }
+            val looksLikeActivity = file.content.contains("ComponentActivity") || file.content.contains(": Activity")
+            val className = classOf[card.path].orEmpty()
+            if (looksLikeActivity && className.isNotBlank() && !manifest.contains(className)) {
+                warnings += "$className looks like an Activity but AndroidManifest.xml has no matching entry"
+            }
+        }
+
+        touched.filter { it.kind == "delete" && it.path.endsWith(".kt") }.forEach { card ->
+            val deletedClass = card.path.substringAfterLast('/').removeSuffix(".kt")
+            val stillReferenced = files.any { it.path != card.path && it.path.endsWith(".kt") && it.content.contains(deletedClass) }
+            if (stillReferenced) warnings += "$deletedClass was deleted but another file still references it"
+        }
+
+        val detail = when {
+            warnings.isNotEmpty() -> "Checked imports and manifest entries across ${touched.size} touched file(s). ${warnings.size} possible issue(s): ${warnings.joinToString("; ")}"
+            connections > 0 -> "Checked imports and manifest entries across ${touched.size} touched file(s); $connections cross-file reference(s) matched."
+            else -> "Checked imports and manifest entries across ${touched.size} touched file(s); no cross-file Kotlin references to verify."
+        }
+        addWorkLine("Wiring", detail, if (warnings.isEmpty()) StepState.SUCCESS else StepState.FAILED)
+    }
+
+    private fun visibleResponse(raw: String): String {
+        val complete = raw.replace(closeActionRegex, "")
+        val open = complete.indexOf("<sa_action", ignoreCase = true)
+        return (if (open >= 0) complete.substring(0, open) else complete).trimEnd()
+    }
+
+    private fun recentHistory(): String = messages.takeLast(12).joinToString("\n") {
+        if (it.user) "USER: ${it.text}" else "SA: ${it.text.take(3500)}"
+    }
+
+    private fun buildContext(): String = files.take(12).joinToString("\n\n") {
+        "FILE: ${it.path}\n${it.content.take(6000)}"
+    }
+
+    override fun onCleared() {
+        runCatching { LlamaBridge.nativeCancelGenerate() }
+        viewModelScope.launch(Dispatchers.IO) { runCatching { LlamaBridge.shutdown() } }
+        super.onCleared()
+    }
+}
