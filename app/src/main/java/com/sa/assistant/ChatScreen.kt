@@ -1,6 +1,7 @@
 package com.sa.assistant
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -27,6 +29,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowUpward
@@ -130,7 +133,21 @@ private fun MessageBubble(vm: SAViewModel, message: ChatMessage) {
         ) {
             Column {
                 if (message.text.isNotBlank()) {
-                    Text(message.text, color = TXT, fontSize = 14.sp, lineHeight = 20.sp)
+                    // Cap the bubble at ~7 lines (7 * 20sp line height) and scroll the
+                    // overflow inside it instead of letting the bubble grow without limit.
+                    // While tokens are still streaming in, keep this inner scroll pinned to
+                    // the bottom so the newest text is always the visible text.
+                    val bubbleScroll = rememberScrollState()
+                    LaunchedEffect(message.text) {
+                        if (message.streaming) bubbleScroll.scrollTo(bubbleScroll.maxValue)
+                    }
+                    Box(
+                        Modifier
+                            .heightIn(max = 140.dp)
+                            .verticalScroll(bubbleScroll)
+                    ) {
+                        Text(message.text, color = TXT, fontSize = 14.sp, lineHeight = 20.sp)
+                    }
                 }
                 if (message.streaming) {
                     Row(
@@ -146,6 +163,10 @@ private fun MessageBubble(vm: SAViewModel, message: ChatMessage) {
                         }
                     }
                 }
+                if (message.zipUri != null) {
+                    Spacer(Modifier.height(if (message.text.isNotBlank()) 8.dp else 0.dp))
+                    ZipDownloadCard(message.zipUri, message.zipName ?: "project.zip")
+                }
             }
         }
         if (message.user && !vm.isWorking) {
@@ -154,6 +175,48 @@ private fun MessageBubble(vm: SAViewModel, message: ChatMessage) {
             }
         }
     }
+}
+
+// The card a "zip do" chat message ends with once the file is actually written to
+// Downloads. Both buttons act on the same real content:// Uri MediaStore handed back —
+// there is nothing to fake here, the zip already exists on disk before this shows.
+@Composable
+private fun ZipDownloadCard(zipUri: String, zipName: String) {
+    val context = LocalContext.current
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(SURFACE3)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(Icons.Default.AttachFile, contentDescription = null, tint = CYAN, modifier = Modifier.size(16.dp))
+        Spacer(Modifier.width(8.dp))
+        Text(zipName, color = TXT, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        TextButton(onClick = { openZip(context, zipUri) }, contentPadding = PaddingValues(horizontal = 6.dp)) {
+            Text("Open", color = CYAN, fontSize = 11.sp)
+        }
+        TextButton(onClick = { shareZip(context, zipUri, zipName) }, contentPadding = PaddingValues(horizontal = 6.dp)) {
+            Text("Share", color = CYAN, fontSize = 11.sp)
+        }
+    }
+}
+
+private fun openZip(context: Context, zipUri: String) {
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(Uri.parse(zipUri), "application/zip")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    runCatching { context.startActivity(intent) }
+}
+
+private fun shareZip(context: Context, zipUri: String, zipName: String) {
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "application/zip"
+        putExtra(Intent.EXTRA_STREAM, Uri.parse(zipUri))
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    runCatching { context.startActivity(Intent.createChooser(intent, "Share $zipName").apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }) }
 }
 
 @Composable

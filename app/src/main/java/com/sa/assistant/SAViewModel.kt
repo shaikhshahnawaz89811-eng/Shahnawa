@@ -1,8 +1,10 @@
 package com.sa.assistant
 
 import android.app.Application
+import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
+import android.provider.MediaStore
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -20,6 +22,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.ByteArrayOutputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -294,11 +297,16 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 LlamaBridge.updateGenerateParams(
                     temperature = 0.35f,
-                    maxTokens = 1024,
+                    // 1024 was cutting whole-project generations off mid-file (e.g. a
+                    // build.gradle.kts card left "Interrupted before completion") because a
+                    // scaffolded app needs several files in one response. Raised alongside
+                    // contextLength below so there's still room for the prompt + history.
+                    // Lower both back down if this OOMs on low-RAM devices.
+                    maxTokens = 4096,
                     topP = 0.90f,
                     topK = 40,
                     repeatPenalty = 1.08f,
-                    contextLength = 4096,
+                    contextLength = 8192,
                     numThreads = maxOf(2, (Runtime.getRuntime().availableProcessors() - 2).coerceAtMost(6)),
                     useMmap = true,
                     flashAttention = false,
@@ -312,7 +320,7 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
                     modelLoaded = ok
                     sessionActive = false
                     modelMeta = if (ok) {
-                        "Loaded • ${type ?: "unknown/base"} • context 4096 • mmap"
+                        "Loaded • ${type ?: "unknown/base"} • context 8192 • mmap"
                     } else "Model load failed"
                 }
             } catch (e: Throwable) {
@@ -329,6 +337,17 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
         streamMessageId = null
         messages += ChatMessage(System.currentTimeMillis(), true, text)
         input = ""
+        // "zip do" / "export zip" etc. are a request for the project ZIP, not a coding
+        // task — routing them to the model just gets a generic refusal, since the model
+        // has no idea that feature exists. Short-circuit straight to a real MediaStore
+        // save and drop the result right in the chat bubble as an Open/Share card.
+        if (isZipExportIntent(text)) {
+            val placeholderId = System.currentTimeMillis() + 1
+            messages += ChatMessage(placeholderId, false, "Saving ${projectName}.zip to Downloads…")
+            persistState()
+            exportZipToChatDownloads(placeholderId)
+            return
+        }
         taskTitle = text
         lastTaskSaved = false
         errorText = ""
@@ -352,6 +371,17 @@ internal class SAViewModel(app: Application) : AndroidViewModel(app) {
         processedActionKeys.clear()
         workspaceChangedThisTurn = false
         generationJob = viewModelScope.launch { runAgent(text) }
+    }
+
+    // Matches short zip-export requests typed in chat, in English or common Hinglish
+    // phrasing ("zip do", "zip banao", "zip bhejo"), without catching normal sentences
+    // that merely mention the word "zip" as part of a real coding request.
+    private fun isZipExportIntent(text: String): Boolean {
+        val t = text.trim().lowercase()
+        val zipWord = Regex("\\bzip\\b")
+        if (!zipWord.containsMatchIn(t)) return false
+        val actionWord = Regex("\\b(do|de|dedo|dijiye|banao|bana|bhejo|chahiye|export|download|save)\\b")
+        return t.split(Regex("\\s+")).size <= 5 && actionWord.containsMatchIn(t)
     }
 
     private suspend fun runAgent(user: String) {
@@ -605,19 +635,24 @@ Project: $projectName"""
         }
     }
 
+    // Shared by every export path (manual SAF export, the silent per-turn auto-snapshot,
+    // and the chat "zip do" shortcut) so the actual bytes written can never drift between
+    // them — one place writes the zip, each caller just decides where it goes.
+    private fun writeZipEntries(zip: ZipOutputStream, exportFiles: List<ProjectFile>) {
+        exportFiles.forEach { f ->
+            zip.putNextEntry(ZipEntry(f.path))
+            zip.write(f.content.toByteArray())
+            zip.closeEntry()
+        }
+    }
+
     fun exportZip(context: Context, uri: Uri) {
         saveFile()
         val exportFiles = files.toList()
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 context.contentResolver.openOutputStream(uri)?.use { output ->
-                    ZipOutputStream(output).use { zip ->
-                        exportFiles.forEach { f ->
-                            zip.putNextEntry(ZipEntry(f.path))
-                            zip.write(f.content.toByteArray())
-                            zip.closeEntry()
-                        }
-                    }
+                    ZipOutputStream(output).use { zip -> writeZipEntries(zip, exportFiles) }
                 } ?: error("Unable to create destination file")
                 withContext(Dispatchers.Main) { screen = Screen.ZIP }
             } catch (e: Throwable) {
@@ -639,13 +674,7 @@ Project: $projectName"""
                 dir.mkdirs()
                 val target = File(dir, "${projectName}_${System.currentTimeMillis()}.zip")
                 FileOutputStream(target).use { output ->
-                    ZipOutputStream(output).use { zip ->
-                        exportFiles.forEach { f ->
-                            zip.putNextEntry(ZipEntry(f.path))
-                            zip.write(f.content.toByteArray())
-                            zip.closeEntry()
-                        }
-                    }
+                    ZipOutputStream(output).use { zip -> writeZipEntries(zip, exportFiles) }
                 }
                 withContext(Dispatchers.Main) {
                     addWorkLine("Auto-saved ZIP", "Saved ${exportFiles.size} files to ${target.absolutePath}", StepState.SUCCESS)
@@ -662,6 +691,50 @@ Project: $projectName"""
         lastTaskSaved = true
         persistState()
         screen = Screen.CHAT
+    }
+
+    // The chat "zip do" shortcut: builds the same zip as exportZip()/autoExportZip(), but
+    // inserts it straight into the public Downloads collection via MediaStore. That insert
+    // needs no runtime permission and no SAF tap on API 29+ (this app's minSdk), so it can
+    // run the instant the request comes in and hand back a real content:// Uri — which is
+    // what lets the chat bubble show working Open/Share buttons instead of a plain message.
+    private fun exportZipToChatDownloads(placeholderId: Long) {
+        saveFile()
+        val exportFiles = files.toList()
+        val fileName = "${projectName}.zip"
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val resolver = getApplication<Application>().contentResolver
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, "application/zip")
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: error("MediaStore refused to create the download entry")
+                resolver.openOutputStream(uri)?.use { output ->
+                    ZipOutputStream(output).use { zip -> writeZipEntries(zip, exportFiles) }
+                } ?: error("Unable to open the download entry for writing")
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+                withContext(Dispatchers.Main) {
+                    val i = messages.indexOfFirst { it.id == placeholderId }
+                    val confirmText = "Saved $fileName to Downloads (${exportFiles.size} files)."
+                    if (i >= 0) messages[i] = messages[i].copy(text = confirmText, streaming = false, zipUri = uri.toString(), zipName = fileName)
+                    addWorkLine("Saved ZIP", "$fileName (${exportFiles.size} files) written to Downloads via MediaStore.", StepState.SUCCESS)
+                    persistState()
+                }
+            } catch (e: Throwable) {
+                withContext(Dispatchers.Main) {
+                    val i = messages.indexOfFirst { it.id == placeholderId }
+                    val failText = "ZIP save failed: ${e.message ?: "unknown error"}"
+                    if (i >= 0) messages[i] = messages[i].copy(text = failText, streaming = false)
+                    addWorkLine("ZIP save failed", e.message ?: "unknown error", StepState.FAILED)
+                    persistState()
+                }
+            }
+        }
     }
 
     fun toggleWorkLine(id: Long) {
@@ -749,8 +822,17 @@ Project: $projectName"""
         }
         when (type) {
             "create" -> {
-                if (files.any { it.path == path }) {
-                    upsertFileCard(cardId, type, path, summary = "$path already exists", state = CardState.FAILED)
+                // A brand-new project is seeded with starter scaffold files (AndroidManifest.xml,
+                // build.gradle.kts, MainActivity.kt...), so the model will very often "create" a
+                // path that already exists purely because the scaffold got there first — that is
+                // not a real conflict, it's the model writing the real version of a placeholder.
+                // Treat "create" as create-or-overwrite instead of hard-failing on it.
+                val i = files.indexOfFirst { it.path == path }
+                if (i >= 0) {
+                    files[i] = files[i].copy(content = content)
+                    if (selectedFile == path) code = content
+                    workspaceChangedThisTurn = true
+                    upsertFileCard(cardId, type, path, summary = "Overwrote existing, ${content.lines().size} lines", state = CardState.DONE)
                 } else {
                     files += ProjectFile(path, content)
                     workspaceChangedThisTurn = true

@@ -36,7 +36,7 @@ internal enum class StepState { WAITING, RUNNING, SUCCESS, FAILED, PAUSED }
 internal enum class CardState { STREAMING, DONE, FAILED }
 
 data class ProjectFile(val path: String, val content: String)
-data class ChatMessage(val id: Long, val user: Boolean, val text: String, val streaming: Boolean = false)
+data class ChatMessage(val id: Long, val user: Boolean, val text: String, val streaming: Boolean = false, val zipUri: String? = null, val zipName: String? = null)
 data class Attachment(val uri: String, val name: String, val kind: String = "file")
 internal data class WorkLine(val id: Long, val title: String, val detail: String = "", val state: StepState = StepState.WAITING, val expandable: Boolean = true)
 
