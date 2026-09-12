@@ -96,6 +96,25 @@ check on real hardware. The GitHub Actions workflow (`:app:testDebugUnitTest`, `
 `:app:assembleDebug`) already in this repo is the first real compiler this code will meet — treat
 its result, not this document, as the authoritative build check.
 
+## What the real build actually caught
+
+It did catch something, exactly as expected: `compileDebugKotlin` failed in `ChatScreen.kt`,
+`EditorScreen.kt`, `ProjectScreens.kt`, `Shared.kt`, and `WorkCards.kt` with `Cannot access 'val
+RowColumnParentData?.weight: Float': it is internal in file`. Every one of those files had an
+`import androidx.compose.foundation.layout.weight` line. That import was wrong: `weight()` for
+`Modifier` is not a top-level function in that package — it's declared as a member of the
+`RowScope`/`ColumnScope` interfaces themselves (`fun Modifier.weight(...)` inside `interface
+RowScope`), so it needs no import at all once code is lexically inside a `Row { }` or `Column { }`
+— it resolves automatically through the implicit scope receiver. The bare import instead matched
+an unrelated internal top-level property of the same short name used by Row/Column's own layout
+math, and the compiler correctly refused to let application code touch it. The fix was to delete
+that one import line from each of the five files; every actual `.weight(1f)` call site was already
+correctly nested inside a `Row`/`Column`, so nothing else needed to change.
+
+This is a real gap in the sandbox verification described above: checking "is there an import
+statement for this name" cannot catch importing the *wrong* symbol of the same name, only a real
+compiler resolving actual scope and visibility can. That's exactly what this CI run is for.
+
 ## Known limitations
 
 - Wiring only understands `import` lines and plain substring matches against the manifest. It has
